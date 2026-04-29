@@ -12,7 +12,7 @@ The scanner is only `cln.py`. There is no install step for the default scanner a
   CLN Scanner Demo
 </video>
 
-[CLN Scanner Demo](demo.mp4)
+[![CLN Scanner Demo](demo.gif)](demo.mp4)
 
 ```powershell
 python .\cln.py
