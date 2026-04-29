@@ -8,11 +8,6 @@ It is designed to boot fast, show what it is doing, and avoid expensive work by 
 
 The scanner is only `cln.py`. There is no install step for the default scanner and no package to import.
 
-### Project Demo
-<video src="demo.mp4" controls="controls" style="max-width: 100%;">
-  Your browser does not support the video tag.
-</video>
-
 ```powershell
 python .\cln.py
 ```
