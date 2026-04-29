@@ -81,6 +81,12 @@ reports\cln-scan-YYYYMMDD-HHMMSS-microseconds.txt
 
 Report, JSON, and terminal output redact common tokens, webhook URLs, control characters, and the current home path by default. Use `--no-redact` only for local forensic work where raw evidence is required.
 
+Use a lighter redaction mode when you need to preserve paths but still hide secrets:
+
+```powershell
+python .\cln.py --redact-level secrets --json
+```
+
 Deep-check Windows app signatures:
 
 ```powershell
@@ -91,6 +97,12 @@ Scan source-code scripts outside risky folders too:
 
 ```powershell
 python .\cln.py --include-source
+```
+
+Limit nested ZIP recursion for hostile or very complex archives:
+
+```powershell
+python .\cln.py --archive-depth 1 C:\Users\You\Downloads
 ```
 
 Quiet mode:
@@ -147,9 +159,12 @@ python .\cln.py --yara-rules .\yara-rules
 - Zip files, Office documents, Java/Android packages, and browser/package archives containing runnable files.
 - Basic visibility for unsupported `.7z`, `.rar`, `.cab`, `.iso`, and `.img` containers.
 - Archive path traversal, suspicious compression ratios, nested ZIPs, embedded macro projects, and external Office links.
+- Configurable nested ZIP recursion depth, with depth-limit findings for skipped inner archives.
+- Sliding-window entropy checks for risky executables and scripts.
+- PE header checks for writable executable sections and unusual entry points.
 - Basic PDF JavaScript/Launch indicators, legacy Office macro indicators, and suspicious shortcut targets.
 - Evidence snippets with byte offsets and line numbers for matched script-content rules.
-- Windows startup folders, registry Run entries, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
+- Windows startup folders, registry Run/RunOnce entries, IFEO debugger keys, shell icon overlay handlers, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
 - Compiled Python artifacts, raw IP indicators, and suspicious URL TLDs in scripts.
 - Known-bad hashes and trusted-hash allowlist visibility.
 
