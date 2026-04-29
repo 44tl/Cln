@@ -8,10 +8,6 @@ It is designed to boot fast, show what it is doing, and avoid expensive work by 
 
 The scanner is only `cln.py`. There is no install step for the default scanner and no package to import.
 
-<video src="demo.mp4" controls muted playsinline>
-  CLN Scanner Demo
-</video>
-
 [![CLN Scanner Demo](demo.gif)](demo.mp4)
 
 ```powershell
@@ -51,6 +47,14 @@ python .\cln.py --startup
 ```
 
 `--startup` also checks suspicious Scheduled Tasks, WMI event subscriptions, and risky Chromium-family browser extensions when those locations are available.
+
+Include running process checks:
+
+```powershell
+python .\cln.py --processes
+```
+
+`--processes` checks command lines for suspicious living-off-the-land usage and, on Windows, scans process memory metadata for executable private regions such as RWX pages.
 
 For the deepest scan, open PowerShell or Command Prompt as Administrator first. Without admin rights, Windows may block locked temp files or protected app files; CLN will skip those and tell you how many were blocked. Temp files can also disappear while the scan is running; CLN counts those as skipped instead of showing them as errors.
 
@@ -167,10 +171,14 @@ python .\cln.py --yara-rules .\yara-rules
 - Archive path traversal, suspicious compression ratios, nested ZIPs, embedded macro projects, and external Office links.
 - Configurable nested ZIP recursion depth, with depth-limit findings for skipped inner archives.
 - Sliding-window entropy checks for risky executables and scripts.
-- PE header checks for writable executable sections and unusual entry points.
-- Basic PDF JavaScript/Launch indicators, legacy Office macro indicators, and suspicious shortcut targets.
+- Native PE checks for ImpHash, suspicious section names, high-entropy executable sections, writable executable sections, risky import clusters, timestamp anomalies, and unusual entry points.
+- Native LNK string parsing for shortcut targets and arguments.
+- PDF object and stream checks for JavaScript, open/launch actions, additional actions, and embedded files.
+- Legacy OLE string extraction for VBA auto-start, shell execution, and obfuscation indicators.
+- Lightweight script string resolution for simple concatenation, reversal, replace, and character-array obfuscation before content rules run.
 - Evidence snippets with byte offsets and line numbers for matched script-content rules.
-- Windows startup folders, registry Run/RunOnce entries, IFEO debugger keys, shell icon overlay handlers, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
+- Windows startup folders, registry Run/RunOnce entries, current-user COM overrides, IFEO debugger keys, AppInit/AppCert DLL settings, shell icon overlay handlers, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
+- Optional running process command-line and executable private memory checks with `--processes`.
 - Compiled Python artifacts, raw IP indicators, and suspicious URL TLDs in scripts.
 - Known-bad hashes and trusted-hash allowlist visibility.
 
