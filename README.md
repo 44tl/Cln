@@ -38,12 +38,20 @@ Include Windows startup checks:
 python .\cln.py --startup
 ```
 
+`--startup` also checks suspicious Scheduled Tasks, WMI event subscriptions, and risky Chromium-family browser extensions when those locations are available.
+
 For the deepest scan, open PowerShell or Command Prompt as Administrator first. Without admin rights, Windows may block locked temp files or protected app files; CLN will skip those and tell you how many were blocked. Temp files can also disappear while the scan is running; CLN counts those as skipped instead of showing them as errors.
 
 Output JSON:
 
 ```powershell
 python .\cln.py --json
+```
+
+Output CSV for spreadsheet review:
+
+```powershell
+python .\cln.py --csv
 ```
 
 Every scan saves a readable text report:
@@ -78,7 +86,11 @@ Quarantine confirmed known-bad files:
 python .\cln.py --clean --startup
 ```
 
-Cleanup only acts on built-in confirmed known-bad hashes. Hashes supplied through `--known-bad` are reported, but not removed automatically.
+Cleanup acts on built-in confirmed known-bad hashes by default. To also quarantine hashes supplied through `--known-bad`, opt in explicitly:
+
+```powershell
+python .\cln.py --known-bad .\hashes.json --clean --clean-user-hashes
+```
 
 ## What It Checks
 
@@ -89,13 +101,15 @@ Cleanup only acts on built-in confirmed known-bad hashes. Hashes supplied throug
 - Fake document names like `invoice.pdf.exe`.
 - Scam-like names and script content.
 - Zip files, Office documents, Java/Android packages, and browser/package archives containing runnable files.
+- Basic visibility for unsupported `.7z`, `.rar`, `.cab`, `.iso`, and `.img` containers.
 - Archive path traversal, suspicious compression ratios, embedded macro projects, and external Office links.
 - Evidence snippets with byte offsets and line numbers for matched script-content rules.
-- Windows startup folder and registry entries.
+- Windows startup folders, registry Run entries, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
+- Compiled Python artifacts, raw IP indicators, and suspicious URL TLDs in scripts.
 - Known-bad hashes.
 
 ## Safety
 
-CLN reports suspicious signs by default. Cleanup only acts on built-in confirmed known-bad hash matches.
+CLN reports suspicious signs by default. Cleanup only acts on built-in confirmed known-bad hash matches unless `--clean-user-hashes` is supplied with `--clean`.
 
 No scanner can catch every threat. Use CLN as one layer alongside Windows Defender, browser protections, and careful account recovery steps after a real infection.
