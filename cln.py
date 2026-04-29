@@ -14,8 +14,11 @@ import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import time
+import zlib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -34,6 +37,8 @@ MAX_ARCHIVE_CONTENT_CANDIDATES = 200
 MAX_ARCHIVE_TEXT_ENTRY_BYTES = 300_000
 MAX_ARCHIVE_FINDINGS = 80
 MAX_ENTROPY_WINDOWS = 16
+MAX_PDF_OBJECT_SCAN_BYTES = 8_000_000
+MAX_STRUCTURED_TEXT_BYTES = 2_000_000
 DEFAULT_EXCLUDED_DIRS = {"reports", "quarantine", "__pycache__", ".git", ".venv", "venv"}
 COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 COLORS = {
@@ -191,6 +196,52 @@ EXPECTED_FILE_TYPES_BY_EXTENSION = {
     ".msi": {"compound-document"},
     ".rar": {"rar-archive"},
     ".7z": {"7z-archive"},
+}
+
+SUSPICIOUS_PE_SECTION_NAMES = {
+    ".aspack",
+    ".adata",
+    ".boom",
+    ".ccg",
+    ".enigma",
+    ".fsg",
+    ".mackt",
+    ".mpress",
+    ".nsp",
+    ".packed",
+    ".petite",
+    ".pklstb",
+    ".rmnet",
+    ".svkp",
+    ".themida",
+    ".upx",
+    ".upx0",
+    ".upx1",
+    ".vmp",
+    ".vmp0",
+    ".vmp1",
+    ".winapi",
+    ".yoda",
+}
+
+HIGH_RISK_IMPORTS = {
+    "virtualalloc",
+    "virtualallocex",
+    "writeprocessmemory",
+    "createremotethread",
+    "ntcreatethreadex",
+    "rtlcreateuserthread",
+    "setwindowshookex",
+    "loadlibrarya",
+    "loadlibraryw",
+    "getprocaddress",
+    "urldownloadtofilea",
+    "urldownloadtofilew",
+    "internetopenurla",
+    "internetopenurlw",
+    "winexec",
+    "shellexecutea",
+    "shellexecutew",
 }
 
 
@@ -356,6 +407,37 @@ class ScanSummary:
                 if result.findings or result.error
             ],
         }
+
+
+@dataclass(frozen=True)
+class PESection:
+    name: str
+    virtual_size: int
+    virtual_address: int
+    raw_size: int
+    raw_pointer: int
+    characteristics: int
+
+    @property
+    def executable(self) -> bool:
+        return bool(self.characteristics & 0x20000000)
+
+    @property
+    def writable(self) -> bool:
+        return bool(self.characteristics & 0x80000000)
+
+
+@dataclass
+class PEInfo:
+    machine: int = 0
+    timestamp: int = 0
+    is_pe64: bool = False
+    entry_point_rva: int = 0
+    image_base: int = 0
+    import_table_rva: int = 0
+    import_table_size: int = 0
+    sections: list[PESection] = field(default_factory=list)
+    imports: list[tuple[str, str]] = field(default_factory=list)
 
 
 def finding_to_dict(finding: Finding, *, redact: bool | str = True) -> dict[str, str | None]:
@@ -532,7 +614,7 @@ class Scanner:
                     result.findings.append(Finding("packed-or-obfuscated", "High-entropy executable or script", "medium", f"{sample_note} entropy={entropy:.2f}"))
 
             if result.file_type in {"windows-pe", "mz-executable"}:
-                result.findings.extend(analyze_pe_header(sample))
+                result.findings.extend(analyze_pe_file(path, sample, result.size or len(sample), info.st_mtime))
 
             if self.check_signatures and (suffix in SIGNED_APP_EXTENSIONS or result.file_type == "windows-pe"):
                 self.scan_signature(path, result)
@@ -690,6 +772,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("paths", nargs="*", type=Path, help="Files or folders to scan. Defaults to Downloads, Desktop, Documents, and temp.")
     parser.add_argument("--full", action="store_true", help="Scan the whole user profile.")
     parser.add_argument("--startup", action="store_true", help="Inspect Windows startup folders and registry Run keys.")
+    parser.add_argument("--processes", action="store_true", help="Inspect running process command lines and executable memory regions on Windows.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--csv", action="store_true", help="Print findings as CSV.")
     parser.add_argument("--sarif", type=Path, help="Write a SARIF 2.1.0 report for code-scanning or CI ingestion.")
@@ -757,6 +840,11 @@ def main(argv: list[str] | None = None) -> int:
             say("Startup", "Checking folders, registry persistence, tasks, WMI, and browser extensions", "cyan")
         startup_results = scan_startup_locations()
         summary.results.extend(startup_results)
+        summary.results.sort(key=lambda item: (-item.score, item.path.lower()))
+    if args.processes:
+        if verbose:
+            say("Processes", "Checking command lines and executable private memory regions", "cyan")
+        summary.results.extend(scan_running_processes())
         summary.results.sort(key=lambda item: (-item.score, item.path.lower()))
 
     cleanup_report: list[str] = []
@@ -1423,50 +1511,164 @@ def max_sliding_window_entropy(path: Path, size: int, chunk_size: int = ENTROPY_
 
 
 def analyze_pe_header(sample: bytes) -> list[Finding]:
-    if not sample.startswith(b"MZ") or len(sample) < 0x40:
-        return []
-    pe_offset = int.from_bytes(sample[0x3C:0x40], "little", signed=False)
-    if pe_offset < 0 or pe_offset > len(sample) - 24 or sample[pe_offset : pe_offset + 4] != b"PE\0\0":
-        return []
-    file_header = pe_offset + 4
-    section_count = int.from_bytes(sample[file_header + 2 : file_header + 4], "little", signed=False)
-    optional_size = int.from_bytes(sample[file_header + 16 : file_header + 18], "little", signed=False)
-    optional_offset = file_header + 20
-    section_offset = optional_offset + optional_size
-    if section_count <= 0 or section_count > 96 or section_offset > len(sample):
-        return []
-    entry_point_rva = 0
-    if optional_size >= 20 and optional_offset + 20 <= len(sample):
-        magic = int.from_bytes(sample[optional_offset : optional_offset + 2], "little", signed=False)
-        if magic in {0x10B, 0x20B}:
-            entry_point_rva = int.from_bytes(sample[optional_offset + 16 : optional_offset + 20], "little", signed=False)
+    return analyze_pe_bytes(sample, file_size=len(sample), file_mtime=None)
 
+
+def analyze_pe_file(path: Path, sample: bytes, file_size: int, file_mtime: float | None) -> list[Finding]:
+    data = sample
+    if file_size <= MAX_STRUCTURED_TEXT_BYTES and file_size > len(sample):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            data = sample
+    return analyze_pe_bytes(data, file_size=file_size, file_mtime=file_mtime)
+
+
+def analyze_pe_bytes(data: bytes, *, file_size: int, file_mtime: float | None) -> list[Finding]:
+    info = parse_pe(data)
+    if not info:
+        return []
     findings: list[Finding] = []
     entry_section_name = ""
-    for index in range(section_count):
-        offset = section_offset + (index * 40)
-        if offset + 40 > len(sample):
-            findings.append(Finding("pe-truncated-section-table", "PE section table is truncated", "low", f"sections={section_count}, parsed={index}"))
-            break
-        raw_name = sample[offset : offset + 8].split(b"\0", 1)[0]
-        name = raw_name.decode("ascii", errors="replace") or f"section-{index}"
-        virtual_size = int.from_bytes(sample[offset + 8 : offset + 12], "little", signed=False)
-        virtual_address = int.from_bytes(sample[offset + 12 : offset + 16], "little", signed=False)
-        characteristics = int.from_bytes(sample[offset + 36 : offset + 40], "little", signed=False)
-        executable = bool(characteristics & 0x20000000)
-        writable = bool(characteristics & 0x80000000)
-        if executable and writable:
-            findings.append(Finding("pe-writable-code-section", "PE executable section is writable", "high", f"{name} characteristics=0x{characteristics:08x}"))
-        if entry_point_rva and virtual_address <= entry_point_rva < virtual_address + max(virtual_size, 1):
-            entry_section_name = name
-            if not executable:
-                findings.append(Finding("pe-entrypoint-not-executable", "PE entry point is in a non-executable section", "medium", f"{name} rva=0x{entry_point_rva:x}"))
+    now = int(time.time())
+    if info.timestamp:
+        timestamp_text = datetime.fromtimestamp(info.timestamp).isoformat(timespec="seconds")
+        if info.timestamp > now + 86400:
+            findings.append(Finding("pe-future-timestamp", "PE compile timestamp is in the future", "medium", timestamp_text))
+        if file_mtime and info.timestamp < int(file_mtime) - (365 * 24 * 3600 * 5):
+            findings.append(Finding("pe-stale-timestamp", "PE compile timestamp is much older than file modification time", "low", f"compiled={timestamp_text}, modified={datetime.fromtimestamp(file_mtime).isoformat(timespec='seconds')}"))
 
-    if entry_point_rva and not entry_section_name:
-        findings.append(Finding("pe-entrypoint-outside-sections", "PE entry point is outside declared sections", "high", f"rva=0x{entry_point_rva:x}"))
+    for section in info.sections:
+        lower_name = section.name.lower()
+        if lower_name in SUSPICIOUS_PE_SECTION_NAMES or lower_name.startswith((".upx", ".vmp")):
+            findings.append(Finding("pe-suspicious-section-name", "PE has a packer or protector section name", "high", section.name))
+        if section.executable and section.writable:
+            findings.append(Finding("pe-writable-code-section", "PE executable section is writable", "high", f"{section.name} characteristics=0x{section.characteristics:08x}"))
+        if section.executable and section.raw_size and section.raw_pointer < len(data):
+            section_bytes = data[section.raw_pointer : min(len(data), section.raw_pointer + min(section.raw_size, 262_144))]
+            entropy = estimate_entropy_bytes(section_bytes)
+            if entropy >= 7.35:
+                findings.append(Finding("pe-high-entropy-executable-section", "PE executable section has high entropy", "high", f"{section.name} entropy={entropy:.2f}"))
+        if info.entry_point_rva and section.virtual_address <= info.entry_point_rva < section.virtual_address + max(section.virtual_size, 1):
+            entry_section_name = section.name
+            if not section.executable:
+                findings.append(Finding("pe-entrypoint-not-executable", "PE entry point is in a non-executable section", "medium", f"{section.name} rva=0x{info.entry_point_rva:x}"))
+
+    if info.entry_point_rva and not entry_section_name:
+        findings.append(Finding("pe-entrypoint-outside-sections", "PE entry point is outside declared sections", "high", f"rva=0x{info.entry_point_rva:x}"))
     elif entry_section_name and entry_section_name.lower() not in {".text", "code", ".code", "text"}:
         findings.append(Finding("pe-unusual-entrypoint-section", "PE entry point is in an unusual section", "low", entry_section_name))
+
+    if info.imports:
+        imphash = pe_imphash(info.imports)
+        imported_names = {name.lower() for _, name in info.imports}
+        risky = sorted(imported_names.intersection(HIGH_RISK_IMPORTS))
+        if {"virtualallocex", "writeprocessmemory"}.issubset(imported_names) and ("createremotethread" in imported_names or "ntcreatethreadex" in imported_names):
+            findings.append(Finding("pe-injection-imports", "PE imports common process injection APIs", "high", f"imphash={imphash}, imports={', '.join(risky[:12])}"))
+        elif len(risky) >= 4:
+            findings.append(Finding("pe-risky-import-cluster", "PE imports multiple risky Windows APIs", "medium", f"imphash={imphash}, imports={', '.join(risky[:12])}"))
     return findings
+
+
+def parse_pe(data: bytes) -> PEInfo | None:
+    if not data.startswith(b"MZ") or len(data) < 0x40:
+        return None
+    pe_offset = int.from_bytes(data[0x3C:0x40], "little", signed=False)
+    if pe_offset > len(data) - 24 or data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        return None
+    file_header = pe_offset + 4
+    machine, section_count, timestamp, _, _, optional_size, _ = struct.unpack_from("<HHIIIHH", data, file_header)
+    optional_offset = file_header + 20
+    section_offset = optional_offset + optional_size
+    if section_count <= 0 or section_count > 96 or section_offset > len(data):
+        return None
+    if optional_offset + 2 > len(data):
+        return None
+    magic = int.from_bytes(data[optional_offset : optional_offset + 2], "little", signed=False)
+    if magic not in {0x10B, 0x20B}:
+        return None
+    info = PEInfo(machine=machine, timestamp=timestamp, is_pe64=magic == 0x20B)
+    if optional_offset + 20 <= len(data):
+        info.entry_point_rva = int.from_bytes(data[optional_offset + 16 : optional_offset + 20], "little", signed=False)
+    data_directory_offset = optional_offset + (96 if magic == 0x10B else 112)
+    if data_directory_offset + 8 <= len(data):
+        info.import_table_rva = int.from_bytes(data[data_directory_offset + 8 : data_directory_offset + 12], "little", signed=False)
+        info.import_table_size = int.from_bytes(data[data_directory_offset + 12 : data_directory_offset + 16], "little", signed=False)
+    for index in range(section_count):
+        offset = section_offset + (index * 40)
+        if offset + 40 > len(data):
+            break
+        raw_name = data[offset : offset + 8].split(b"\0", 1)[0]
+        name = raw_name.decode("ascii", errors="replace") or f"section-{index}"
+        virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from("<IIII", data, offset + 8)
+        characteristics = int.from_bytes(data[offset + 36 : offset + 40], "little", signed=False)
+        info.sections.append(PESection(name, virtual_size, virtual_address, raw_size, raw_pointer, characteristics))
+    info.imports = parse_pe_imports(data, info)
+    return info
+
+
+def rva_to_offset(rva: int, sections: list[PESection]) -> int | None:
+    for section in sections:
+        span = max(section.virtual_size, section.raw_size, 1)
+        if section.virtual_address <= rva < section.virtual_address + span:
+            return section.raw_pointer + (rva - section.virtual_address)
+    return None
+
+
+def read_c_string(data: bytes, offset: int, limit: int = 512) -> str:
+    if offset < 0 or offset >= len(data):
+        return ""
+    end = data.find(b"\0", offset, min(len(data), offset + limit))
+    if end == -1:
+        end = min(len(data), offset + limit)
+    return data[offset:end].decode("ascii", errors="ignore").strip()
+
+
+def parse_pe_imports(data: bytes, info: PEInfo) -> list[tuple[str, str]]:
+    if not info.import_table_rva:
+        return []
+    descriptor_offset = rva_to_offset(info.import_table_rva, info.sections)
+    if descriptor_offset is None:
+        return []
+    imports: list[tuple[str, str]] = []
+    thunk_size = 8 if info.is_pe64 else 4
+    for descriptor_index in range(256):
+        offset = descriptor_offset + (descriptor_index * 20)
+        if offset + 20 > len(data):
+            break
+        original_first_thunk, _, _, name_rva, first_thunk = struct.unpack_from("<IIIII", data, offset)
+        if not any((original_first_thunk, name_rva, first_thunk)):
+            break
+        dll_offset = rva_to_offset(name_rva, info.sections)
+        dll_name = read_c_string(data, dll_offset) if dll_offset is not None else ""
+        thunk_rva = original_first_thunk or first_thunk
+        thunk_offset = rva_to_offset(thunk_rva, info.sections)
+        if thunk_offset is None:
+            continue
+        for thunk_index in range(4096):
+            entry_offset = thunk_offset + (thunk_index * thunk_size)
+            if entry_offset + thunk_size > len(data):
+                break
+            thunk_value = int.from_bytes(data[entry_offset : entry_offset + thunk_size], "little", signed=False)
+            if thunk_value == 0:
+                break
+            ordinal_mask = 0x8000000000000000 if thunk_size == 8 else 0x80000000
+            if thunk_value & ordinal_mask:
+                api_name = f"ord{thunk_value & 0xFFFF}"
+            else:
+                hint_name_offset = rva_to_offset(thunk_value, info.sections)
+                api_name = read_c_string(data, hint_name_offset + 2) if hint_name_offset is not None else ""
+            if dll_name and api_name:
+                imports.append((dll_name, api_name))
+    return imports
+
+
+def pe_imphash(imports: list[tuple[str, str]]) -> str:
+    normalized = []
+    for dll_name, api_name in imports:
+        dll = dll_name.lower().rsplit(".", 1)[0]
+        normalized.append(f"{dll}.{api_name.lower()}")
+    return hashlib.md5(",".join(normalized).encode("utf-8")).hexdigest()
 
 
 def detect_file_type(path: Path, sample: bytes) -> str:
@@ -1679,10 +1881,15 @@ def content_scan_views(data: bytes) -> Iterable[tuple[str, bytes]]:
     yielded = {data}
     for encoding, text in decoded_text_views(data):
         normalized = text.encode("utf-8", errors="replace")
-        if normalized in yielded:
-            continue
-        yielded.add(normalized)
-        yield encoding, normalized
+        if normalized not in yielded:
+            yielded.add(normalized)
+            yield encoding, normalized
+        resolved = resolve_script_strings(text)
+        if resolved:
+            resolved_bytes = resolved.encode("utf-8", errors="replace")
+            if resolved_bytes not in yielded:
+                yielded.add(resolved_bytes)
+                yield f"{encoding} string-resolution", resolved_bytes
 
 
 def decoded_text_views(data: bytes) -> Iterable[tuple[str, str]]:
@@ -1713,6 +1920,49 @@ def is_probably_text(text: str) -> bool:
         return False
     printable = sum(1 for char in sample if char.isprintable() or char.isspace())
     return printable / len(sample) >= 0.85
+
+
+def resolve_script_strings(text: str) -> str:
+    if len(text) > MAX_STRUCTURED_TEXT_BYTES:
+        text = text[:MAX_STRUCTURED_TEXT_BYTES]
+    parts = [text]
+    strings = extract_quoted_strings(text)
+    if strings:
+        parts.append("\n".join(strings))
+    for match in re.finditer(r"(?is)(?:['\"][^'\"]{1,200}['\"]\s*(?:\+|&)\s*){1,20}['\"][^'\"]{1,200}['\"]", text):
+        values = re.findall(r"['\"]([^'\"]{1,200})['\"]", match.group(0))
+        if len(values) >= 2:
+            joined = "".join(values)
+            if joined:
+                parts.append(joined)
+    for match in re.finditer(r"(?is)(['\"])([^'\"]{2,500})\1\s*\.\s*(?:split\(\s*['\"]{2}\s*\)\s*)?reverse\(\s*\)\s*\.\s*join\(\s*['\"]{2}\s*\)", text):
+        parts.append(match.group(2)[::-1])
+    for match in re.finditer(r"(?is)(['\"])([^'\"]{1,500})\1\s*\.\s*replace\(\s*(['\"])(.*?)\3\s*,\s*(['\"])(.*?)\5\s*\)", text):
+        parts.append(match.group(2).replace(match.group(4), match.group(6)))
+    for match in re.finditer(r"(?is)\[string\]\s*::\s*join\(\s*['\"]{2}\s*,\s*\((.*?)\)\s*\)", text):
+        values = re.findall(r"['\"]([^'\"]{1,100})['\"]", match.group(1))
+        if values:
+            parts.append("".join(values))
+    for match in re.finditer(r"(?is)(?:-join\s*)?\(?\s*([0-9]{2,3}(?:\s*,\s*[0-9]{2,3}){2,200})\s*\)?\s*\|\s*%?\s*\{\s*\[char\]\s*\$_\s*\}", text):
+        chars = []
+        for item in re.findall(r"[0-9]{2,3}", match.group(1)):
+            value = int(item)
+            if 0 <= value <= 255:
+                chars.append(chr(value))
+        if chars:
+            parts.append("".join(chars))
+    normalized = "\n".join(dict.fromkeys(part for part in parts if part))
+    normalized = normalized.replace("`", "")
+    return normalized if normalized != text else ""
+
+
+def extract_quoted_strings(text: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(r"(?s)(['\"])(.{1,500}?)\1", text):
+        value = match.group(2)
+        if any(char.isalnum() for char in value):
+            values.append(value)
+    return values[:500]
 
 
 def scan_powershell_encoded_payloads(data: bytes, existing_rule_ids: set[str]) -> list[Finding]:
@@ -1780,28 +2030,156 @@ def safe_excerpt(data: bytes, limit: int = 180) -> str:
     return text
 
 
+def read_structured_document_bytes(path: Path, sample: bytes, limit: int = MAX_PDF_OBJECT_SCAN_BYTES) -> bytes:
+    try:
+        size = path.stat().st_size
+        if size <= limit and size > len(sample):
+            return path.read_bytes()
+    except OSError:
+        pass
+    return sample
+
+
+def parse_lnk_command(data: bytes) -> tuple[str, str]:
+    if len(data) < 0x4C or not data.startswith(b"\x4C\x00\x00\x00\x01\x14\x02\x00"):
+        return "", ""
+    offset = 0x4C
+    flags = int.from_bytes(data[0x14:0x18], "little", signed=False)
+    is_unicode = bool(flags & 0x80)
+    if flags & 0x01:
+        if offset + 2 > len(data):
+            return "", ""
+        id_list_size = int.from_bytes(data[offset : offset + 2], "little", signed=False)
+        offset += 2 + id_list_size
+    if flags & 0x02:
+        if offset + 4 > len(data):
+            return "", ""
+        link_info_size = int.from_bytes(data[offset : offset + 4], "little", signed=False)
+        offset += link_info_size
+    values: dict[int, str] = {}
+    for bit in (0x04, 0x08, 0x10, 0x20, 0x40):
+        if not (flags & bit):
+            continue
+        if offset + 2 > len(data):
+            break
+        char_count = int.from_bytes(data[offset : offset + 2], "little", signed=False)
+        offset += 2
+        byte_count = char_count * 2 if is_unicode else char_count
+        if offset + byte_count > len(data):
+            break
+        raw = data[offset : offset + byte_count]
+        offset += byte_count
+        value = raw.decode("utf-16-le" if is_unicode else "cp1252", errors="replace").strip("\0\r\n ")
+        values[bit] = value
+    target = values.get(0x08) or values.get(0x04) or ""
+    arguments = values.get(0x20) or ""
+    return target, arguments
+
+
+def scan_lnk_content(path: Path, data: bytes) -> list[Finding]:
+    target, arguments = parse_lnk_command(data)
+    command = " ".join(part for part in (target, arguments) if part).strip()
+    if not command:
+        return []
+    findings: list[Finding] = []
+    command_bytes = command.encode("utf-8", errors="replace")
+    if re.search(r"(?is)\b(?:powershell|pwsh|mshta|wscript|cscript|rundll32|cmd|regsvr32)(?:\.exe)?\b", command):
+        findings.append(
+            Finding(
+                "shortcut-suspicious-target",
+                "Shortcut launches a suspicious command interpreter",
+                "high",
+                f"{path.name}: {command[:300]}",
+                safe_excerpt(command_bytes),
+                "Inspect the parsed shortcut target and arguments before opening it.",
+            )
+        )
+    for finding in scan_content_rule_matches(command_bytes, "Pattern matched in parsed shortcut command line"):
+        findings.append(Finding(f"shortcut-{finding.rule_id}", f"Shortcut command: {finding.title}", finding.severity, finding.detail, finding.evidence, finding.remediation))
+    return findings
+
+
+def extract_pdf_analysis_bytes(data: bytes) -> bytes:
+    chunks = [data[:MAX_TEXT_SCAN_BYTES]]
+    for match in re.finditer(rb"(?is)(\d+)\s+(\d+)\s+obj(.*?)endobj", data[:MAX_PDF_OBJECT_SCAN_BYTES]):
+        body = match.group(3)
+        chunks.append(body[:200_000])
+        stream_match = re.search(rb"(?is)<<(.*?)>>\s*stream\r?\n(.*?)\r?\nendstream", body)
+        if stream_match:
+            stream_dict = stream_match.group(1)
+            stream_data = stream_match.group(2)
+            if b"/FlateDecode" in stream_dict:
+                try:
+                    chunks.append(zlib.decompress(stream_data)[:200_000])
+                except zlib.error:
+                    pass
+            else:
+                chunks.append(stream_data[:200_000])
+    return b"\n".join(chunks)
+
+
+def scan_pdf_content(path: Path, data: bytes) -> list[Finding]:
+    analysis = extract_pdf_analysis_bytes(data)
+    findings: list[Finding] = []
+    rules = (
+        ("pdf-javascript", "PDF contains JavaScript action", rb"(?is)/(?:JavaScript|JS)\b"),
+        ("pdf-open-action", "PDF contains an automatic open action", rb"(?is)/OpenAction\b"),
+        ("pdf-launch-action", "PDF contains a launch action", rb"(?is)/Launch\b"),
+        ("pdf-additional-action", "PDF contains additional automatic actions", rb"(?is)/AA\b"),
+        ("pdf-embedded-file", "PDF contains embedded files", rb"(?is)/(?:EmbeddedFiles|Filespec|EmbeddedFile)\b"),
+    )
+    for rule_id, title, pattern in rules:
+        match = re.search(pattern, analysis)
+        if match:
+            findings.append(
+                Finding(
+                    rule_id,
+                    title,
+                    "high" if rule_id in {"pdf-open-action", "pdf-launch-action", "pdf-embedded-file"} else "medium",
+                    str(path.name),
+                    describe_match(analysis, match.start(), match.end()),
+                    "Open the PDF only in a sandboxed viewer and verify it with a dedicated PDF analysis tool.",
+                )
+            )
+    return findings
+
+
+def extract_ole_strings(data: bytes) -> bytes:
+    chunks = [data[:MAX_TEXT_SCAN_BYTES]]
+    for encoding in ("latin-1", "utf-16-le"):
+        try:
+            text = data[:MAX_STRUCTURED_TEXT_BYTES].decode(encoding, errors="ignore")
+        except UnicodeError:
+            continue
+        strings = re.findall(r"[\x09\x0a\x0d\x20-\x7e]{5,}", text)
+        if strings:
+            chunks.append("\n".join(strings[:2000]).encode("utf-8", errors="replace"))
+    return b"\n".join(chunks)
+
+
+def scan_ole_content(path: Path, data: bytes) -> list[Finding]:
+    analysis = extract_ole_strings(data)
+    findings: list[Finding] = []
+    for rule_id, title, pattern in (
+        ("ole-vba-autostart", "OLE/VBA macro has auto-start trigger", rb"(?is)\b(?:AutoOpen|Auto_Open|Document_Open|Workbook_Open|AutoExec|AutoClose)\b"),
+        ("ole-vba-shell", "OLE/VBA macro invokes shell or process execution", rb"(?is)\b(?:Shell|WScript\.Shell|CreateObject|WinExec|ShellExecute)\b.{0,200}\b(?:cmd|powershell|wscript|cscript|mshta|rundll32)?"),
+        ("ole-vba-obfuscation", "OLE/VBA macro has common obfuscation indicators", rb"(?is)\b(?:ChrW?|StrReverse|Environ|Execute|Eval)\b"),
+    ):
+        match = re.search(pattern, analysis)
+        if match:
+            findings.append(Finding(rule_id, title, "high" if "shell" in rule_id or "autostart" in rule_id else "medium", str(path.name), describe_match(analysis, match.start(), match.end()), "Open only with macros disabled and inspect the VBA project before trusting the document."))
+    return findings
+
+
 def scan_basic_document_content(path: Path, sample: bytes, file_type: str | None) -> list[Finding]:
     suffix = path.suffix.lower()
     findings: list[Finding] = []
     if file_type == "pdf-document" or suffix == ".pdf":
-        for rule_id, title, pattern in (
-            ("pdf-javascript", "PDF contains JavaScript action", rb"(?is)/(?:JavaScript|JS)\b"),
-            ("pdf-launch-action", "PDF contains Launch/OpenAction behavior", rb"(?is)/(?:Launch|OpenAction|AA)\b"),
-        ):
-            match = re.search(pattern, sample)
-            if match:
-                findings.append(
-                    Finding(
-                        rule_id,
-                        title,
-                        "medium",
-                        str(path.name),
-                        describe_match(sample, match.start(), match.end()),
-                        "Open the PDF only in a sandboxed viewer and verify it with a dedicated PDF analysis tool.",
-                    )
-                )
+        findings.extend(scan_pdf_content(path, read_structured_document_bytes(path, sample)))
     if file_type == "compound-document" or suffix in {".doc", ".xls", ".ppt", ".msi"}:
-        lowered = sample.lower()
+        data = read_structured_document_bytes(path, sample)
+        findings.extend(scan_ole_content(path, data))
+        lowered = data[:MAX_TEXT_SCAN_BYTES].lower()
         if b"vba" in lowered or b"macros" in lowered or b"attrib" in lowered:
             findings.append(
                 Finding(
@@ -1814,18 +2192,20 @@ def scan_basic_document_content(path: Path, sample: bytes, file_type: str | None
                 )
             )
     if file_type == "windows-shortcut" or suffix == ".lnk":
-        text = sample.decode("utf-16-le", errors="ignore") + "\n" + sample.decode("latin-1", errors="ignore")
-        if re.search(r"(?is)\b(?:powershell|pwsh|mshta|wscript|cscript|rundll32|cmd)(?:\.exe)?\b", text):
-            findings.append(
-                Finding(
-                    "shortcut-suspicious-target",
-                    "Shortcut references a suspicious command interpreter",
-                    "high",
-                    str(path.name),
-                    safe_excerpt(text.encode("utf-8", errors="replace")),
-                    "Inspect the shortcut target and arguments before opening it.",
+        findings.extend(scan_lnk_content(path, read_structured_document_bytes(path, sample)))
+        if not any(finding.rule_id == "shortcut-suspicious-target" for finding in findings):
+            text = sample.decode("utf-16-le", errors="ignore") + "\n" + sample.decode("latin-1", errors="ignore")
+            if re.search(r"(?is)\b(?:powershell|pwsh|mshta|wscript|cscript|rundll32|cmd)(?:\.exe)?\b", text):
+                findings.append(
+                    Finding(
+                        "shortcut-suspicious-target",
+                        "Shortcut references a suspicious command interpreter",
+                        "high",
+                        str(path.name),
+                        safe_excerpt(text.encode("utf-8", errors="replace")),
+                        "Inspect the shortcut target and arguments before opening it.",
+                    )
                 )
-            )
     return findings
 
 
@@ -2303,6 +2683,7 @@ def scan_startup_locations() -> list[ScanResult]:
     results.extend(scan_startup_folders())
     results.extend(scan_registry_run_keys())
     results.extend(scan_registry_persistence_locations())
+    results.extend(scan_registry_value_persistence_locations())
     results.extend(scan_scheduled_tasks())
     results.extend(scan_browser_extensions())
     results.extend(scan_wmi_event_consumers())
@@ -2369,6 +2750,13 @@ def scan_registry_persistence_locations() -> list[ScanResult]:
 
     checks = [
         (
+            "HKEY_CURRENT_USER",
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Classes\CLSID",
+            "com-hijack-hkcu",
+            "Current-user COM class override exists",
+        ),
+        (
             "HKEY_LOCAL_MACHINE",
             winreg.HKEY_LOCAL_MACHINE,
             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
@@ -2389,6 +2777,20 @@ def scan_registry_persistence_locations() -> list[ScanResult]:
             "shell-icon-overlay",
             "Shell icon overlay handler loads into Explorer",
         ),
+        (
+            "HKEY_LOCAL_MACHINE",
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+            "appinit-dlls",
+            "AppInit_DLLs injection setting exists",
+        ),
+        (
+            "HKEY_LOCAL_MACHINE",
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls",
+            "appcert-dlls",
+            "AppCertDlls process injection setting exists",
+        ),
     ]
     results: list[ScanResult] = []
     for hive_name, hive, key_path, rule_id, title in checks:
@@ -2403,8 +2805,14 @@ def scan_registry_persistence_locations() -> list[ScanResult]:
                     subkey_index += 1
                     full_path = f"{hive_name}\\{key_path}\\{subkey_name}"
                     detail = registry_subkey_default_detail(hive, f"{key_path}\\{subkey_name}")
+                    if rule_id == "com-hijack-hkcu":
+                        detail = registry_com_server_detail(hive, f"{key_path}\\{subkey_name}")
+                        if not detail:
+                            continue
                     severity = "high" if suspicious_startup_command(detail) else "medium"
                     if rule_id == "ifeo-debugger" and "debugger" not in detail.lower():
+                        continue
+                    if rule_id == "appinit-dlls" and "appinit_dlls=" not in detail.lower():
                         continue
                     result = ScanResult(path=full_path, kind="registry")
                     result.findings.append(Finding(rule_id, title, severity, detail or subkey_name))
@@ -2434,6 +2842,63 @@ def registry_subkey_default_detail(hive: object, key_path: str) -> str:
     except OSError:
         return ""
     return "; ".join(details)
+
+
+def registry_com_server_detail(hive: object, clsid_path: str) -> str:
+    details: list[str] = []
+    for server_key in ("InprocServer32", "LocalServer32"):
+        detail = registry_subkey_default_detail(hive, f"{clsid_path}\\{server_key}")
+        if detail:
+            details.append(f"{server_key}: {detail}")
+    return "; ".join(details)
+
+
+def scan_registry_value_persistence_locations() -> list[ScanResult]:
+    try:
+        import winreg
+    except ImportError:
+        return []
+    checks = [
+        (
+            "HKEY_LOCAL_MACHINE",
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+            {"AppInit_DLLs", "LoadAppInit_DLLs"},
+            "appinit-dlls",
+            "AppInit_DLLs process injection setting exists",
+        ),
+        (
+            "HKEY_LOCAL_MACHINE",
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls",
+            None,
+            "appcert-dlls",
+            "AppCertDlls process injection setting exists",
+        ),
+    ]
+    results: list[ScanResult] = []
+    for hive_name, hive, key_path, names, rule_id, title in checks:
+        try:
+            with winreg.OpenKey(hive, key_path) as key:
+                index = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    index += 1
+                    if names is not None and name not in names:
+                        continue
+                    value_text = str(value).strip()
+                    if not value_text or value_text in {"0", "[]"}:
+                        continue
+                    result = ScanResult(path=f"{hive_name}\\{key_path}\\{name}", kind="registry")
+                    severity = "high" if suspicious_startup_command(value_text) or rule_id == "appcert-dlls" else "medium"
+                    result.findings.append(Finding(rule_id, title, severity, value_text))
+                    results.append(result)
+        except OSError:
+            continue
+    return results
 
 
 def scan_scheduled_tasks() -> list[ScanResult]:
@@ -2616,6 +3081,173 @@ def scan_wmi_event_consumers() -> list[ScanResult]:
         result.findings.append(Finding("wmi-event-consumer", "WMI subscription persistence exists", severity, detail or class_name))
         results.append(result)
     return results
+
+
+def scan_running_processes() -> list[ScanResult]:
+    if platform.system() != "Windows":
+        return []
+    results = scan_process_command_lines()
+    results.extend(scan_process_memory_regions())
+    return results
+
+
+def scan_process_command_lines() -> list[ScanResult]:
+    powershell = trusted_windows_executable("WindowsPowerShell", "v1.0", "powershell.exe")
+    if not powershell:
+        return []
+    script = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run([str(powershell), "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=15, check=False)
+    except Exception:
+        return []
+    try:
+        data = json.loads(completed.stdout) if completed.stdout.strip() else []
+    except json.JSONDecodeError:
+        return []
+    items = data if isinstance(data, list) else [data]
+    results: list[ScanResult] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or "")
+        command = str(item.get("CommandLine") or "")
+        pid = str(item.get("ProcessId") or "")
+        if not command:
+            continue
+        findings = suspicious_process_command_findings(name, command)
+        if findings:
+            result = ScanResult(path=f"process:{pid}:{name}", kind="process")
+            result.findings.extend(findings)
+            results.append(result)
+    return results
+
+
+def suspicious_process_command_findings(name: str, command: str) -> list[Finding]:
+    lowered = command.lower()
+    exe = name.lower()
+    checks = [
+        ("lolbin-certutil-download", "certutil downloads or decodes remote content", "certutil" in exe and ("-urlcache" in lowered or "-decode" in lowered or "http://" in lowered or "https://" in lowered)),
+        ("lolbin-msbuild-inline-task", "MSBuild loads an inline task or project from user-writable content", "msbuild" in exe and ("codetaskfactory" in lowered or "inline task" in lowered or "appdata" in lowered or "\\temp\\" in lowered)),
+        ("lolbin-wmic-process-create", "WMIC creates a process", "wmic" in exe and "process" in lowered and "call" in lowered and "create" in lowered),
+        ("lolbin-rundll32-script", "rundll32 launches script or URL handler content", "rundll32" in exe and any(token in lowered for token in ("javascript:", "http://", "https://", "url.dll", "shell32.dll"))),
+        ("lolbin-regsvr32-scriptlet", "regsvr32 loads remote or scriptlet content", "regsvr32" in exe and any(token in lowered for token in ("scrobj.dll", "/i:http", "/i:https", ".sct"))),
+        ("lolbin-powershell-encoded", "PowerShell runs an encoded command", ("powershell" in exe or "pwsh" in exe) and re.search(r"(?i)(?<!\w)-(?:enc|encodedcommand)(?!\w)", command) is not None),
+    ]
+    findings = [Finding(rule_id, title, "high", command[:500]) for rule_id, title, matched in checks if matched]
+    if not findings and suspicious_startup_command(command):
+        findings.append(Finding("process-suspicious-command", "Process command line has suspicious execution indicators", "medium", command[:500]))
+    return findings
+
+
+def scan_process_memory_regions() -> list[ScanResult]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return []
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    MEM_COMMIT = 0x1000
+    MEM_PRIVATE = 0x20000
+    PAGE_EXECUTE_READWRITE = 0x40
+    PAGE_EXECUTE_WRITECOPY = 0x80
+    PAGE_EXECUTE_READ = 0x20
+    PAGE_EXECUTE = 0x10
+
+    class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BaseAddress", ctypes.c_void_p),
+            ("AllocationBase", ctypes.c_void_p),
+            ("AllocationProtect", wintypes.DWORD),
+            ("RegionSize", ctypes.c_size_t),
+            ("State", wintypes.DWORD),
+            ("Protect", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+        ]
+
+    process_ids = (wintypes.DWORD * 8192)()
+    needed = wintypes.DWORD()
+    if not psapi.EnumProcesses(ctypes.byref(process_ids), ctypes.sizeof(process_ids), ctypes.byref(needed)):
+        return []
+    count = min(needed.value // ctypes.sizeof(wintypes.DWORD), 8192)
+    results: list[ScanResult] = []
+    for raw_pid in list(process_ids)[:count]:
+        pid = int(raw_pid)
+        if pid in {0, os.getpid()}:
+            continue
+        handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+        if not handle:
+            continue
+        try:
+            process_name = process_image_name(psapi, handle) or "unknown"
+            findings = executable_private_memory_findings(kernel32, handle)
+            if findings:
+                result = ScanResult(path=f"process-memory:{pid}:{process_name}", kind="process-memory")
+                result.findings.extend(findings)
+                results.append(result)
+        finally:
+            kernel32.CloseHandle(handle)
+        if len(results) >= 200:
+            break
+    return results
+
+
+def process_image_name(psapi: object, handle: object) -> str:
+    try:
+        import ctypes
+    except ImportError:
+        return ""
+    buffer = ctypes.create_unicode_buffer(1024)
+    try:
+        length = psapi.GetModuleFileNameExW(handle, None, buffer, len(buffer))
+    except Exception:
+        return ""
+    return buffer.value[:length] if length else ""
+
+
+def executable_private_memory_findings(kernel32: object, handle: object) -> list[Finding]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return []
+    MEM_COMMIT = 0x1000
+    MEM_PRIVATE = 0x20000
+    executable = {0x10, 0x20, 0x40, 0x80}
+
+    class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BaseAddress", ctypes.c_void_p),
+            ("AllocationBase", ctypes.c_void_p),
+            ("AllocationProtect", wintypes.DWORD),
+            ("RegionSize", ctypes.c_size_t),
+            ("State", wintypes.DWORD),
+            ("Protect", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+        ]
+
+    findings: list[Finding] = []
+    address = 0
+    mbi = MEMORY_BASIC_INFORMATION()
+    while address < 0x7FFFFFFFFFFF and len(findings) < 8:
+        size = kernel32.VirtualQueryEx(handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi))
+        if not size:
+            break
+        protect = int(mbi.Protect) & 0xFF
+        if int(mbi.State) == MEM_COMMIT and int(mbi.Type) == MEM_PRIVATE and protect in executable:
+            rule_id = "process-rwx-private-memory" if protect in {0x40, 0x80} else "process-executable-private-memory"
+            severity = "high" if protect in {0x40, 0x80} else "medium"
+            findings.append(Finding(rule_id, "Process has executable private memory region", severity, f"base=0x{int(mbi.BaseAddress or 0):x}, size={format_bytes(int(mbi.RegionSize))}, protect=0x{protect:x}"))
+        next_address = int(mbi.BaseAddress or address) + int(mbi.RegionSize or 4096)
+        if next_address <= address:
+            break
+        address = next_address
+    return findings
 
 
 def suspicious_startup_command(value: str) -> bool:
