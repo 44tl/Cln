@@ -33,6 +33,7 @@ MAX_ARCHIVE_ENTRIES = 1_000
 MAX_ARCHIVE_CONTENT_CANDIDATES = 200
 MAX_ARCHIVE_TEXT_ENTRY_BYTES = 300_000
 MAX_ARCHIVE_FINDINGS = 80
+MAX_ENTROPY_WINDOWS = 16
 DEFAULT_EXCLUDED_DIRS = {"reports", "quarantine", "__pycache__", ".git", ".venv", "venv"}
 COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 COLORS = {
@@ -259,6 +260,7 @@ CONTENT_RULES = RuleSet([
 ])
 
 AUTHENTICODE_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
+REDACTION_LEVELS = {"full", "secrets", "none"}
 
 BIDI_CONTROL_CHARS = frozenset(chr(value) for value in range(0x202A, 0x202F)) | frozenset(chr(value) for value in range(0x2066, 0x206A))
 SECRET_REDACTIONS: list[tuple[re.Pattern[str], str]] = [
@@ -327,7 +329,7 @@ class ScanSummary:
     vanished_files: int = 0
     elapsed_seconds: float = 0.0
 
-    def to_dict(self, *, redact: bool = True) -> dict:
+    def to_dict(self, *, redact: bool | str = True) -> dict:
         return {
             "scanner": "CLN",
             "version": VERSION,
@@ -356,7 +358,7 @@ class ScanSummary:
         }
 
 
-def finding_to_dict(finding: Finding, *, redact: bool = True) -> dict[str, str | None]:
+def finding_to_dict(finding: Finding, *, redact: bool | str = True) -> dict[str, str | None]:
     return {
         "rule_id": output_text(finding.rule_id, redact=redact),
         "title": output_text(finding.title, redact=redact),
@@ -367,25 +369,37 @@ def finding_to_dict(finding: Finding, *, redact: bool = True) -> dict[str, str |
     }
 
 
-def output_text(value: object, *, redact: bool = True, limit: int | None = None) -> str:
+def output_text(value: object, *, redact: bool | str = True, limit: int | None = None) -> str:
     text = str(value)
-    if redact:
-        text = redact_text(text)
+    redaction_level = normalize_redaction_level(redact)
+    if redaction_level != "none":
+        text = redact_text(text, level=redaction_level)
     escaped = escape_control_text(text)
     if limit is not None and len(escaped) > limit:
         return f"{escaped[: max(0, limit - 3)]}..."
     return escaped
 
 
-def redact_text(text: str) -> str:
-    home = str(Path.home())
-    username = os.environ.get("USERNAME") or Path.home().name
-    if username and len(username) >= 2:
-        text = re.sub(rf"(?i)([\\/](?:users|documents and settings)[\\/]){re.escape(username)}(?=[\\/])", r"\1<user>", text)
-        text = re.sub(rf"(?i)(\bC:[\\/]Users[\\/]){re.escape(username)}(?=[\\/])", r"\1<user>", text)
-    if home:
-        text = re.sub(re.escape(home), "~", text, flags=re.IGNORECASE)
-        text = re.sub(re.escape(home.replace("\\", "/")), "~", text, flags=re.IGNORECASE)
+def normalize_redaction_level(redact: bool | str) -> str:
+    if isinstance(redact, bool):
+        return "full" if redact else "none"
+    if redact not in REDACTION_LEVELS:
+        raise ValueError(f"unsupported redaction level: {redact}")
+    return redact
+
+
+def redact_text(text: str, *, level: str = "full") -> str:
+    if level not in REDACTION_LEVELS:
+        raise ValueError(f"unsupported redaction level: {level}")
+    if level == "full":
+        home = str(Path.home())
+        username = os.environ.get("USERNAME") or Path.home().name
+        if username and len(username) >= 2:
+            text = re.sub(rf"(?i)([\\/](?:users|documents and settings)[\\/]){re.escape(username)}(?=[\\/])", r"\1<user>", text)
+            text = re.sub(rf"(?i)(\bC:[\\/]Users[\\/]){re.escape(username)}(?=[\\/])", r"\1<user>", text)
+        if home:
+            text = re.sub(re.escape(home), "~", text, flags=re.IGNORECASE)
+            text = re.sub(re.escape(home.replace("\\", "/")), "~", text, flags=re.IGNORECASE)
     for pattern, replacement in SECRET_REDACTIONS:
         text = pattern.sub(replacement, text)
     return text
@@ -423,6 +437,7 @@ class Scanner:
         include_source: bool,
         verbose: bool,
         recent_days: int,
+        archive_depth: int = 2,
     ) -> None:
         self.max_bytes = max_bytes
         self.workers = workers or min(32, (os.cpu_count() or 4) + 4)
@@ -433,6 +448,7 @@ class Scanner:
         self.include_source = include_source
         self.verbose = verbose
         self.recent_cutoff = datetime.now() - timedelta(days=recent_days)
+        self.archive_depth = archive_depth
 
     def scan_paths(self, paths: Iterable[Path]) -> ScanSummary:
         started = datetime.now()
@@ -502,7 +518,7 @@ class Scanner:
                 result.findings.append(Finding("oversized-risky-file", "Risky file exceeds content scan size limit", "low", f"size={format_bytes(result.size)}, limit={format_bytes(self.max_bytes)}", remediation="Inspect with a full antivirus scan or increase --max-mb for a deeper content scan."))
 
             if self.inspect_archives and should_inspect_archive(suffix, result.file_type):
-                result.findings.extend(scan_zip(path))
+                result.findings.extend(scan_zip(path, max_depth=self.archive_depth))
             elif self.inspect_archives and should_report_unsupported_archive(suffix, result.file_type):
                 result.findings.extend(scan_unsupported_archive(path, result.file_type, sample))
 
@@ -510,11 +526,13 @@ class Scanner:
                 result.findings.extend(scan_content_bytes(sample))
 
             if should_check_entropy(suffix, result.file_type):
-                entropy_data = read_entropy_sample(path, result.size or 0) if (result.size or 0) > len(sample) * 2 else sample
-                entropy = estimate_entropy_bytes(entropy_data)
+                entropy = estimate_file_entropy(path, result.size or 0, sample)
                 if entropy >= 7.4:
-                    sample_note = "sampled" if entropy_data is not sample else "initial"
+                    sample_note = "sliding-window" if (result.size or 0) > ENTROPY_SAMPLE_CHUNK_BYTES else "initial"
                     result.findings.append(Finding("packed-or-obfuscated", "High-entropy executable or script", "medium", f"{sample_note} entropy={entropy:.2f}"))
+
+            if result.file_type in {"windows-pe", "mz-executable"}:
+                result.findings.extend(analyze_pe_header(sample))
 
             if self.check_signatures and (suffix in SIGNED_APP_EXTENSIONS or result.file_type == "windows-pe"):
                 self.scan_signature(path, result)
@@ -614,6 +632,26 @@ class Scanner:
                     remediation="Confirm the download origin and signature before running the installer.",
                 )
             )
+        if {"ps-encoded-command", "risky-location"}.issubset(rule_ids) and "compound-encoded-powershell-risky-location" not in rule_ids:
+            result.findings.append(
+                Finding(
+                    "compound-encoded-powershell-risky-location",
+                    "Encoded PowerShell in risky location",
+                    "critical",
+                    "Encoded PowerShell content combined with a user-writable or download location",
+                    remediation="Treat as high priority until the encoded command is decoded and verified.",
+                )
+            )
+        if {"archive-runnable", "archive-suspicious-name"}.issubset(rule_ids) and "compound-scam-archive-runnable" not in rule_ids:
+            result.findings.append(
+                Finding(
+                    "compound-scam-archive-runnable",
+                    "Scam-themed archive contains runnable content",
+                    "high",
+                    "Archive naming indicators combined with executable or script content",
+                    remediation="Do not extract or run the archive contents until the source is verified.",
+                )
+            )
 
 
 def positive_int(value: str) -> int:
@@ -637,6 +675,13 @@ def worker_count(value: str) -> int:
     return parsed
 
 
+def archive_depth(value: str) -> int:
+    parsed = non_negative_int(value)
+    if parsed > 8:
+        raise argparse.ArgumentTypeError("must be between 0 and 8")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cln",
@@ -656,10 +701,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--known-bad", type=Path, help="JSON array of known bad SHA-256 hashes.")
     parser.add_argument("--known-good", type=Path, help="JSON array of trusted SHA-256 hashes.")
     parser.add_argument("--no-archives", action="store_true", help="Do not inspect zip archive entry names.")
+    parser.add_argument("--archive-depth", type=archive_depth, default=2, help="Maximum nested zip recursion depth from 0 to 8. Default: 2.")
     parser.add_argument("--signatures", action="store_true", help="Deep-check Windows Authenticode signatures. Slower; off by default.")
     parser.add_argument("--include-source", action="store_true", help="Also scan source-code scripts outside risky locations. More thorough, more review noise.")
     parser.add_argument("--quiet", action="store_true", help="Only print the final report.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
+    parser.add_argument("--redact-level", choices=sorted(REDACTION_LEVELS), default="full", help="Redaction level for output: full, secrets, or none. Default: full.")
     parser.add_argument("--no-redact", action="store_true", help="Do not redact paths, tokens, or evidence in terminal, JSON, and text reports.")
     parser.add_argument("--recent-days", type=non_negative_int, default=14, help="Treat runnable files newer than this as new apps. Default: 14.")
     parser.add_argument("--clean", action="store_true", help="Quarantine built-in confirmed known-bad files found by SHA-256.")
@@ -679,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     global COLOR_ENABLED
     if args.no_color or args.json or args.csv:
         COLOR_ENABLED = False
-    redact_outputs = not args.no_redact
+    redact_outputs = "none" if args.no_redact else args.redact_level
     paths = choose_paths(args)
     verbose = not args.quiet and not args.json and not args.csv
     user_known_bad = load_hashes(args.known_bad)
@@ -700,13 +747,14 @@ def main(argv: list[str] | None = None) -> int:
         include_source=args.include_source,
         verbose=verbose,
         recent_days=args.recent_days,
+        archive_depth=args.archive_depth,
     )
     summary = scanner.scan_paths(paths)
     if args.yara_rules:
         apply_yara_rules(summary, args.yara_rules)
     if args.startup:
         if verbose:
-            say("Startup", "Checking folders and Run/RunOnce registry entries", "cyan")
+            say("Startup", "Checking folders, registry persistence, tasks, WMI, and browser extensions", "cyan")
         startup_results = scan_startup_locations()
         summary.results.extend(startup_results)
         summary.results.sort(key=lambda item: (-item.score, item.path.lower()))
@@ -734,7 +782,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         data = summary.to_dict(redact=redact_outputs)
-        data["redacted"] = redact_outputs
+        data["redacted"] = redact_outputs != "none"
+        data["redaction_level"] = redact_outputs
         data["cleanup"] = [output_text(line, redact=redact_outputs) for line in cleanup_report]
         data["report_path"] = output_text(report_path, redact=redact_outputs) if report_path else None
         data["report_error"] = output_text(report_error, redact=redact_outputs) if report_error else None
@@ -1345,6 +1394,81 @@ def read_entropy_sample(path: Path, size: int, chunk_size: int = ENTROPY_SAMPLE_
     return bytes(sample)
 
 
+def estimate_file_entropy(path: Path, size: int, initial_sample: bytes) -> float:
+    if size <= ENTROPY_SAMPLE_CHUNK_BYTES or size <= len(initial_sample):
+        return estimate_entropy_bytes(initial_sample)
+    return max_sliding_window_entropy(path, size)
+
+
+def max_sliding_window_entropy(path: Path, size: int, chunk_size: int = ENTROPY_SAMPLE_CHUNK_BYTES, max_windows: int = MAX_ENTROPY_WINDOWS) -> float:
+    if size <= 0:
+        return 0.0
+    if size <= chunk_size:
+        try:
+            return estimate_entropy_bytes(path.read_bytes())
+        except OSError:
+            return 0.0
+    window_count = min(max_windows, max(1, math.ceil(size / chunk_size)))
+    max_start = max(0, size - chunk_size)
+    offsets = sorted({round(index * max_start / max(1, window_count - 1)) for index in range(window_count)})
+    highest = 0.0
+    with path.open("rb") as handle:
+        for offset in offsets:
+            handle.seek(offset)
+            data = handle.read(chunk_size)
+            if not data:
+                continue
+            highest = max(highest, estimate_entropy_bytes(data))
+    return highest
+
+
+def analyze_pe_header(sample: bytes) -> list[Finding]:
+    if not sample.startswith(b"MZ") or len(sample) < 0x40:
+        return []
+    pe_offset = int.from_bytes(sample[0x3C:0x40], "little", signed=False)
+    if pe_offset < 0 or pe_offset > len(sample) - 24 or sample[pe_offset : pe_offset + 4] != b"PE\0\0":
+        return []
+    file_header = pe_offset + 4
+    section_count = int.from_bytes(sample[file_header + 2 : file_header + 4], "little", signed=False)
+    optional_size = int.from_bytes(sample[file_header + 16 : file_header + 18], "little", signed=False)
+    optional_offset = file_header + 20
+    section_offset = optional_offset + optional_size
+    if section_count <= 0 or section_count > 96 or section_offset > len(sample):
+        return []
+    entry_point_rva = 0
+    if optional_size >= 20 and optional_offset + 20 <= len(sample):
+        magic = int.from_bytes(sample[optional_offset : optional_offset + 2], "little", signed=False)
+        if magic in {0x10B, 0x20B}:
+            entry_point_rva = int.from_bytes(sample[optional_offset + 16 : optional_offset + 20], "little", signed=False)
+
+    findings: list[Finding] = []
+    entry_section_name = ""
+    for index in range(section_count):
+        offset = section_offset + (index * 40)
+        if offset + 40 > len(sample):
+            findings.append(Finding("pe-truncated-section-table", "PE section table is truncated", "low", f"sections={section_count}, parsed={index}"))
+            break
+        raw_name = sample[offset : offset + 8].split(b"\0", 1)[0]
+        name = raw_name.decode("ascii", errors="replace") or f"section-{index}"
+        virtual_size = int.from_bytes(sample[offset + 8 : offset + 12], "little", signed=False)
+        virtual_address = int.from_bytes(sample[offset + 12 : offset + 16], "little", signed=False)
+        characteristics = int.from_bytes(sample[offset + 36 : offset + 40], "little", signed=False)
+        executable = bool(characteristics & 0x20000000)
+        writable = bool(characteristics & 0x80000000)
+        if executable and writable:
+            findings.append(Finding("pe-writable-code-section", "PE executable section is writable", "high", f"{name} characteristics=0x{characteristics:08x}"))
+        if entry_point_rva and virtual_address <= entry_point_rva < virtual_address + max(virtual_size, 1):
+            entry_section_name = name
+            if not executable:
+                findings.append(Finding("pe-entrypoint-not-executable", "PE entry point is in a non-executable section", "medium", f"{name} rva=0x{entry_point_rva:x}"))
+
+    if entry_point_rva and not entry_section_name:
+        findings.append(Finding("pe-entrypoint-outside-sections", "PE entry point is outside declared sections", "high", f"rva=0x{entry_point_rva:x}"))
+    elif entry_section_name and entry_section_name.lower() not in {".text", "code", ".code", "text"}:
+        findings.append(Finding("pe-unusual-entrypoint-section", "PE entry point is in an unusual section", "low", entry_section_name))
+    return findings
+
+
 def detect_file_type(path: Path, sample: bytes) -> str:
     stripped = sample[:512].lstrip()
     suffix = path.suffix.lower()
@@ -1722,15 +1846,15 @@ def scan_unsupported_archive(path: Path, file_type: str | None, sample: bytes) -
     return findings
 
 
-def scan_zip(path: Path) -> list[Finding]:
+def scan_zip(path: Path, *, max_depth: int = 2) -> list[Finding]:
     try:
         with zipfile.ZipFile(path) as archive:
-            return scan_zip_archive(archive)
+            return scan_zip_archive(archive, max_depth=max_depth)
     except (OSError, zipfile.BadZipFile) as exc:
         return [Finding("bad-zip", "Invalid or damaged zip archive", "low", f"Could not parse as zip: {type(exc).__name__}")]
 
 
-def scan_zip_archive(archive: zipfile.ZipFile) -> list[Finding]:
+def scan_zip_archive(archive: zipfile.ZipFile, *, max_depth: int = 2, depth: int = 0) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple[str, str, str]] = set()
     infos = archive.infolist()
@@ -1802,9 +1926,12 @@ def scan_zip_archive(archive: zipfile.ZipFile) -> list[Finding]:
                     Finding(f"archive-{finding.rule_id}", f"Archive entry: {finding.title}", finding.severity, normalized, finding.evidence, finding.remediation),
                 )
         if suffix in ZIP_CONTAINER_EXTENSIONS:
+            if depth >= max_depth:
+                add_archive_finding(findings, seen, Finding("nested-archive-depth-limit", "Nested archive recursion limit reached", "low", normalized))
+                continue
             data = read_zip_entry_sample(archive, info, findings, seen, normalized, limit=2_000_000)
             if data:
-                nested_findings = scan_nested_zip_bytes(data, normalized)
+                nested_findings = scan_nested_zip_bytes(data, normalized, max_depth=max_depth, depth=depth + 1)
                 for finding in nested_findings:
                     add_archive_finding(findings, seen, finding)
     return findings
@@ -1826,14 +1953,14 @@ def archive_entry_priority(name: str, suffix: str, size: int) -> int:
     return score
 
 
-def scan_nested_zip_bytes(data: bytes, parent_name: str) -> list[Finding]:
+def scan_nested_zip_bytes(data: bytes, parent_name: str, *, max_depth: int = 2, depth: int = 1) -> list[Finding]:
     if not data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
         return []
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as nested:
             return [
                 Finding(f"nested-{finding.rule_id}", f"Nested archive: {finding.title}", finding.severity, f"{parent_name}!/{finding.detail}", finding.evidence, finding.remediation)
-                for finding in scan_zip_archive(nested)
+                for finding in scan_zip_archive(nested, max_depth=max_depth, depth=depth)
             ]
     except (OSError, zipfile.BadZipFile):
         return [Finding("nested-bad-zip", "Nested archive could not be parsed", "low", parent_name)]
@@ -2168,17 +2295,14 @@ def signature_cache_key(path: Path) -> tuple[str, int, int] | None:
 
 
 def should_cache_signature_result(path: Path, status: str, signer: str) -> bool:
-    if status != "Valid" or "microsoft" not in signer.lower():
-        return False
-    system_root = os.environ.get("SystemRoot", r"C:\Windows")
-    system32 = normalize_filesystem_path(Path(system_root) / "System32")
-    return path_is_under(normalize_filesystem_path(path), system32)
+    return status == "Valid" and bool(signer.strip())
 
 
 def scan_startup_locations() -> list[ScanResult]:
     results: list[ScanResult] = []
     results.extend(scan_startup_folders())
     results.extend(scan_registry_run_keys())
+    results.extend(scan_registry_persistence_locations())
     results.extend(scan_scheduled_tasks())
     results.extend(scan_browser_extensions())
     results.extend(scan_wmi_event_consumers())
@@ -2235,6 +2359,81 @@ def scan_registry_run_keys() -> list[ScanResult]:
         except OSError:
             continue
     return results
+
+
+def scan_registry_persistence_locations() -> list[ScanResult]:
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    checks = [
+        (
+            "HKEY_LOCAL_MACHINE",
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+            "ifeo-debugger",
+            "Image File Execution Options debugger persistence",
+        ),
+        (
+            "HKEY_CURRENT_USER",
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers",
+            "shell-icon-overlay",
+            "Shell icon overlay handler loads into Explorer",
+        ),
+        (
+            "HKEY_LOCAL_MACHINE",
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers",
+            "shell-icon-overlay",
+            "Shell icon overlay handler loads into Explorer",
+        ),
+    ]
+    results: list[ScanResult] = []
+    for hive_name, hive, key_path, rule_id, title in checks:
+        try:
+            with winreg.OpenKey(hive, key_path) as key:
+                subkey_index = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(key, subkey_index)
+                    except OSError:
+                        break
+                    subkey_index += 1
+                    full_path = f"{hive_name}\\{key_path}\\{subkey_name}"
+                    detail = registry_subkey_default_detail(hive, f"{key_path}\\{subkey_name}")
+                    severity = "high" if suspicious_startup_command(detail) else "medium"
+                    if rule_id == "ifeo-debugger" and "debugger" not in detail.lower():
+                        continue
+                    result = ScanResult(path=full_path, kind="registry")
+                    result.findings.append(Finding(rule_id, title, severity, detail or subkey_name))
+                    results.append(result)
+        except OSError:
+            continue
+    return results
+
+
+def registry_subkey_default_detail(hive: object, key_path: str) -> str:
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    details: list[str] = []
+    try:
+        with winreg.OpenKey(hive, key_path) as key:
+            index = 0
+            while True:
+                try:
+                    name, value, _ = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                if name == "" or name.lower() in {"debugger", "clSID".lower()}:
+                    details.append(f"{name or '(default)'}={value}")
+                index += 1
+    except OSError:
+        return ""
+    return "; ".join(details)
 
 
 def scan_scheduled_tasks() -> list[ScanResult]:
