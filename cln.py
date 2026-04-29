@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -25,6 +27,7 @@ from typing import Iterable
 VERSION = "0.4.0"
 SEVERITY_SCORE = {"info": 0, "low": 1, "medium": 3, "high": 6, "critical": 10}
 MAX_TEXT_SCAN_BYTES = 1_000_000
+ENTROPY_SAMPLE_CHUNK_BYTES = 128 * 1024
 MAX_ARCHIVE_ENTRIES = 1_000
 MAX_ARCHIVE_TEXT_ENTRY_BYTES = 300_000
 MAX_ARCHIVE_FINDINGS = 80
@@ -98,6 +101,7 @@ ZIP_CONTAINER_EXTENSIONS = {
     ".ppam",
 }
 ARCHIVE_EXTENSIONS = ZIP_CONTAINER_EXTENSIONS
+UNSUPPORTED_ARCHIVE_EXTENSIONS = {".7z", ".rar", ".cab", ".iso", ".img"}
 MACRO_DOCUMENT_EXTENSIONS = {".docm", ".dotm", ".xlsm", ".xlam", ".pptm", ".ppam"}
 ARCHIVE_HIGH_RISK_EXTENSIONS = {
     ".exe",
@@ -162,6 +166,9 @@ DOCUMENT_EXTENSIONS = {
     ".zip",
     ".rar",
     ".7z",
+    ".cab",
+    ".iso",
+    ".img",
 }
 EXPECTED_FILE_TYPES_BY_EXTENSION = {
     ".pdf": {"pdf-document"},
@@ -179,7 +186,17 @@ EXPECTED_FILE_TYPES_BY_EXTENSION = {
     ".jpeg": {"jpeg-image"},
     ".gif": {"gif-image"},
     ".msi": {"compound-document"},
+    ".rar": {"rar-archive"},
+    ".7z": {"7z-archive"},
 }
+
+
+class RuleSet:
+    def __init__(self, rules: list[tuple[str, str, str, re.Pattern[bytes]]]) -> None:
+        self.rules = rules
+
+    def __iter__(self) -> Iterable[tuple[str, str, str, re.Pattern[bytes]]]:
+        return iter(self.rules)
 
 SUSPICIOUS_NAME_PATTERNS = [
     re.compile(r"(?i)\bmr\s*beast\b|\bmrbeast\b"),
@@ -190,7 +207,7 @@ SUSPICIOUS_NAME_PATTERNS = [
     re.compile(r"(?i)\blnstai?er\b"),
 ]
 
-CONTENT_RULES = [
+CONTENT_RULES = RuleSet([
     ("ps-encoded-command", "PowerShell encoded command", "high", re.compile(rb"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b.{0,250}(?<!\w)(?:-enc|-encodedcommand)(?!\w)")),
     ("ps-download-exec", "PowerShell download and execute behavior", "high", re.compile(rb"(?is)\b(?:iex|invoke-expression)\b.{0,200}\b(?:downloadstring|downloadfile|webclient)\b")),
     ("ps-amsi-bypass", "PowerShell AMSI bypass indicators", "high", re.compile(rb"(?is)\b(?:amsiutils|amsiscanbuffer|amsiinitfailed|system\.management\.automation\.amsi)\b")),
@@ -210,8 +227,14 @@ CONTENT_RULES = [
     ("fake-giveaway-language", "Scam giveaway language", "medium", re.compile(rb"(?is)(?:mr\s*beast|mrbeast|giveaway|free\s+(?:robux|crypto|gift\s*card|vbucks)|claim\s+now).{0,250}(?:login|wallet|verify|download|password|seed)")),
     ("suspicious-obfuscation", "Script obfuscation indicators", "medium", re.compile(rb"(?is)(?:fromcharcode|atob\(|base64decode|replace\(.{0,60}split\(|\[[\"']char[\"']\])")),
     ("long-base64-blob", "Long base64-like blob in script", "medium", re.compile(rb"(?s)\b[A-Za-z0-9+/]{220,}={0,2}\b")),
+    ("pyinstaller-artifact", "Compiled Python executable artifact", "medium", re.compile(rb"(?is)(?:_MEI\d{5,}|PYZ-00\.pyz|pydata|pyimod|pyinstaller)")),
+    ("nuitka-artifact", "Nuitka compiled Python artifact", "medium", re.compile(rb"(?is)(?:__nuitka|NUITKA_ONEFILE_PARENT|nuitka_constants|nuitka_loader)")),
+    ("raw-ip-network-indicator", "Raw IP address network indicator", "low", re.compile(rb"(?i)\b(?:https?://)?(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{2,5})?\b")),
+    ("suspicious-tld-network-indicator", "Suspicious or abuse-prone TLD in URL", "medium", re.compile(rb"(?i)\bhttps?://[A-Za-z0-9.-]+\.(?:top|xyz|icu|click|quest|zip|mov|lol|monster|cyou|sbs|cam|shop|live)(?:[/:?#]|$)")),
     ("startup-persistence", "Windows startup persistence command", "high", re.compile(rb"(?is)\\Software\\Microsoft\\Windows\\CurrentVersion\\Run(?:Once)?\\")),
-]
+])
+
+AUTHENTICODE_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
 
 BIDI_CONTROL_CHARS = frozenset(chr(value) for value in range(0x202A, 0x202F)) | frozenset(chr(value) for value in range(0x2066, 0x206A))
 SECRET_REDACTIONS: list[tuple[re.Pattern[str], str]] = [
@@ -330,6 +353,10 @@ def output_text(value: object, *, redact: bool = True, limit: int | None = None)
 
 def redact_text(text: str) -> str:
     home = str(Path.home())
+    username = os.environ.get("USERNAME") or Path.home().name
+    if username and len(username) >= 2:
+        text = re.sub(rf"(?i)([\\/](?:users|documents and settings)[\\/]){re.escape(username)}(?=[\\/])", r"\1<user>", text)
+        text = re.sub(rf"(?i)(\bC:[\\/]Users[\\/]){re.escape(username)}(?=[\\/])", r"\1<user>", text)
     if home:
         text = re.sub(re.escape(home), "~", text, flags=re.IGNORECASE)
         text = re.sub(re.escape(home.replace("\\", "/")), "~", text, flags=re.IGNORECASE)
@@ -440,17 +467,22 @@ class Scanner:
 
             if self.inspect_archives and should_inspect_archive(suffix, result.file_type):
                 result.findings.extend(scan_zip(path))
+            elif self.inspect_archives and should_report_unsupported_archive(suffix, result.file_type):
+                result.findings.extend(scan_unsupported_archive(path, result.file_type, sample))
 
             if should_scan_content(path, result.size or 0, result.file_type, include_source=self.include_source):
                 result.findings.extend(scan_content_bytes(sample))
 
             if should_check_entropy(suffix, result.file_type):
-                entropy = estimate_entropy_bytes(sample)
+                entropy_data = read_entropy_sample(path, result.size or 0) if (result.size or 0) > len(sample) * 2 else sample
+                entropy = estimate_entropy_bytes(entropy_data)
                 if entropy >= 7.4:
-                    result.findings.append(Finding("packed-or-obfuscated", "High-entropy executable or script", "medium", f"entropy={entropy:.2f}"))
+                    sample_note = "sampled" if entropy_data is not sample else "initial"
+                    result.findings.append(Finding("packed-or-obfuscated", "High-entropy executable or script", "medium", f"{sample_note} entropy={entropy:.2f}"))
 
             if self.check_signatures and (suffix in SIGNED_APP_EXTENSIONS or result.file_type == "windows-pe"):
                 self.scan_signature(path, result)
+            self.apply_compound_rules(result)
         except Exception as exc:  # noqa: BLE001 - scanner should keep going.
             result.error = f"{type(exc).__name__}: {exc}"
         return result
@@ -525,6 +557,18 @@ class Scanner:
         elif status:
             result.findings.append(Finding("bad-signature", "Runnable app has an invalid or untrusted signature", "high", status))
 
+    def apply_compound_rules(self, result: ScanResult) -> None:
+        rule_ids = {finding.rule_id for finding in result.findings}
+        if {"unsigned-app", "risky-location", "packed-or-obfuscated"}.issubset(rule_ids) and "compound-unsigned-packed-risky" not in rule_ids:
+            result.findings.append(
+                Finding(
+                    "compound-unsigned-packed-risky",
+                    "Unsigned packed app in risky location",
+                    "critical",
+                    "Unsigned, high-entropy runnable file located in a user-writable or download location",
+                )
+            )
+
 
 def positive_int(value: str) -> int:
     parsed = int(value)
@@ -556,6 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full", action="store_true", help="Scan the whole user profile.")
     parser.add_argument("--startup", action="store_true", help="Inspect Windows startup folders and registry Run keys.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    parser.add_argument("--csv", action="store_true", help="Print findings as CSV.")
     parser.add_argument("--max-mb", type=positive_int, default=75, help="Skip files larger than this size. Default: 75.")
     parser.add_argument("--workers", type=worker_count, default=None, help="Parallel worker count from 1 to 64. Default: auto.")
     parser.add_argument("--known-bad", type=Path, help="JSON array of known bad SHA-256 hashes.")
@@ -568,6 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-redact", action="store_true", help="Do not redact paths, tokens, or evidence in terminal, JSON, and text reports.")
     parser.add_argument("--recent-days", type=non_negative_int, default=14, help="Treat runnable files newer than this as new apps. Default: 14.")
     parser.add_argument("--clean", action="store_true", help="Quarantine built-in confirmed known-bad files found by SHA-256.")
+    parser.add_argument("--clean-user-hashes", action="store_true", help="With --clean, also quarantine hashes supplied through --known-bad.")
     parser.add_argument("--delete", action="store_true", help="With --clean, permanently delete built-in confirmed known-bad files instead of quarantining.")
     parser.add_argument("--quarantine-dir", type=Path, default=Path("quarantine"), help="Where --clean stores removed files. Default: .\\quarantine")
     parser.add_argument("--report-dir", type=Path, default=Path("reports"), help="Where readable text reports are saved. Default: .\\reports")
@@ -576,13 +622,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.json and args.csv:
+        parser.error("--json and --csv cannot be used together")
     global COLOR_ENABLED
-    if args.no_color or args.json:
+    if args.no_color or args.json or args.csv:
         COLOR_ENABLED = False
     redact_outputs = not args.no_redact
     paths = choose_paths(args)
-    verbose = not args.quiet and not args.json
+    verbose = not args.quiet and not args.json and not args.csv
+    user_known_bad = load_hashes(args.known_bad)
+    cleanable_hashes = BUILTIN_KNOWN_BAD_SHA256 | (user_known_bad if args.clean_user_hashes else set())
     if verbose:
         print_banner()
         say("Mode", "fast scan; deep signature checks are off unless --signatures is used", "cyan")
@@ -590,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     scanner = Scanner(
         max_bytes=args.max_mb * 1024 * 1024,
         workers=args.workers,
-        known_bad=BUILTIN_KNOWN_BAD_SHA256 | load_hashes(args.known_bad),
+        known_bad=BUILTIN_KNOWN_BAD_SHA256 | user_known_bad,
         known_good=load_hashes(args.known_good),
         inspect_archives=not args.no_archives,
         check_signatures=args.signatures,
@@ -608,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cleanup_report: list[str] = []
     if args.clean:
-        cleanup_report = clean_known_bad(summary, args.quarantine_dir, delete=args.delete, cleanable_hashes=BUILTIN_KNOWN_BAD_SHA256)
+        cleanup_report = clean_known_bad(summary, args.quarantine_dir, delete=args.delete, cleanable_hashes=cleanable_hashes)
 
     report_path: Path | None = None
     report_error: str | None = None
@@ -624,6 +675,8 @@ def main(argv: list[str] | None = None) -> int:
         data["report_path"] = output_text(report_path, redact=redact_outputs) if report_path else None
         data["report_error"] = output_text(report_error, redact=redact_outputs) if report_error else None
         print(json.dumps(data, indent=2))
+    elif args.csv:
+        print(summary_to_csv(summary, redact=redact_outputs), end="")
     else:
         print_report(summary, paths, scanner.check_signatures, redact=redact_outputs)
         if cleanup_report:
@@ -673,6 +726,58 @@ def severity_label(severity: str) -> str:
 def verdict_label(verdict: str) -> str:
     tone = {"dangerous": "red", "suspicious": "yellow", "review": "cyan", "error": "red", "clean": "green"}.get(verdict, "dim")
     return color(f"[{verdict.upper()}]", tone)
+
+
+def summary_to_csv(summary: ScanSummary, *, redact: bool = True) -> str:
+    output = io.StringIO(newline="")
+    fieldnames = [
+        "path",
+        "kind",
+        "verdict",
+        "score",
+        "severity",
+        "rule_id",
+        "title",
+        "detail",
+        "evidence",
+        "sha256",
+        "size",
+        "modified",
+        "file_type",
+        "error",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for result in summary.results:
+        if not result.findings and not result.error:
+            continue
+        base = {
+            "path": output_text(result.path, redact=redact),
+            "kind": output_text(result.kind, redact=redact),
+            "verdict": result.verdict,
+            "score": result.score,
+            "sha256": output_text(result.sha256, redact=redact) if result.sha256 else "",
+            "size": result.size if result.size is not None else "",
+            "modified": output_text(result.modified, redact=redact) if result.modified else "",
+            "file_type": output_text(result.file_type, redact=redact) if result.file_type else "",
+            "error": output_text(result.error, redact=redact) if result.error else "",
+        }
+        if result.findings:
+            for finding in result.findings:
+                row = dict(base)
+                row.update(
+                    {
+                        "severity": output_text(finding.severity, redact=redact),
+                        "rule_id": output_text(finding.rule_id, redact=redact),
+                        "title": output_text(finding.title, redact=redact),
+                        "detail": output_text(finding.detail, redact=redact),
+                        "evidence": output_text(finding.evidence, redact=redact) if finding.evidence else "",
+                    }
+                )
+                writer.writerow(row)
+        else:
+            writer.writerow({**base, "severity": "", "rule_id": "", "title": "", "detail": "", "evidence": ""})
+    return output.getvalue()
 
 
 def print_report(summary: ScanSummary, paths: list[Path], signatures_enabled: bool, *, redact: bool = True) -> None:
@@ -867,6 +972,7 @@ def should_queue_oversized_file(path: Path) -> bool:
     return (
         suffix in DANGEROUS_EXTENSIONS
         or suffix in ARCHIVE_EXTENSIONS
+        or suffix in UNSUPPORTED_ARCHIVE_EXTENSIONS
         or suffix in SOURCE_CODE_EXTENSIONS
         or is_double_extension(path)
         or bool(suspicious_name_hits(path))
@@ -924,6 +1030,26 @@ def read_file_sample_and_hash(path: Path, sample_limit: int = MAX_TEXT_SCAN_BYTE
     return digest.hexdigest(), bytes(sample)
 
 
+def read_entropy_sample(path: Path, size: int, chunk_size: int = ENTROPY_SAMPLE_CHUNK_BYTES) -> bytes:
+    if size <= 0:
+        return b""
+    offsets = [0]
+    if size > chunk_size * 2:
+        offsets.append(max(0, (size // 2) - (chunk_size // 2)))
+    if size > chunk_size:
+        offsets.append(max(0, size - chunk_size))
+    sample = bytearray()
+    seen_offsets: set[int] = set()
+    with path.open("rb") as handle:
+        for offset in offsets:
+            if offset in seen_offsets:
+                continue
+            seen_offsets.add(offset)
+            handle.seek(offset)
+            sample.extend(handle.read(chunk_size))
+    return bytes(sample)
+
+
 def detect_file_type(path: Path, sample: bytes) -> str:
     stripped = sample[:512].lstrip()
     suffix = path.suffix.lower()
@@ -953,6 +1079,10 @@ def detect_file_type(path: Path, sample: bytes) -> str:
         return "rar-archive"
     if sample.startswith(b"7z\xBC\xAF\x27\x1C"):
         return "7z-archive"
+    if sample.startswith(b"MSCF"):
+        return "cab-archive"
+    if b"Rar!\x1A\x07" in sample[:262_144] or b"7z\xBC\xAF\x27\x1C" in sample[:262_144]:
+        return "self-extracting-archive"
     if sample.startswith(b"\x4C\x00\x00\x00\x01\x14\x02\x00"):
         return "windows-shortcut"
     if stripped.startswith(b"#!"):
@@ -968,8 +1098,12 @@ def should_inspect_archive(suffix: str, file_type: str | None) -> bool:
     return suffix in ZIP_CONTAINER_EXTENSIONS or file_type == "zip-container"
 
 
+def should_report_unsupported_archive(suffix: str, file_type: str | None) -> bool:
+    return suffix in UNSUPPORTED_ARCHIVE_EXTENSIONS or file_type in {"rar-archive", "7z-archive", "cab-archive", "self-extracting-archive"}
+
+
 def should_check_entropy(suffix: str, file_type: str | None) -> bool:
-    return suffix in DANGEROUS_EXTENSIONS or suffix in SOURCE_CODE_EXTENSIONS or file_type in {"windows-pe", "mz-executable", "elf-binary", "macho-binary"}
+    return suffix in DANGEROUS_EXTENSIONS or suffix in SOURCE_CODE_EXTENSIONS or suffix in UNSUPPORTED_ARCHIVE_EXTENSIONS or file_type in {"windows-pe", "mz-executable", "elf-binary", "macho-binary", "self-extracting-archive"}
 
 
 def is_double_extension(path: Path) -> bool:
@@ -1220,6 +1354,23 @@ def safe_excerpt(data: bytes, limit: int = 180) -> str:
     return text
 
 
+def scan_unsupported_archive(path: Path, file_type: str | None, sample: bytes) -> list[Finding]:
+    suffix = path.suffix.lower()
+    findings = [
+        Finding(
+            "unsupported-archive",
+            "Archive format is detected but not deeply inspected",
+            "low",
+            f"extension={suffix or '(none)'}, detected={file_type or 'unknown'}",
+        )
+    ]
+    if file_type == "self-extracting-archive" or (sample.startswith(b"MZ") and (b"Rar!\x1A\x07" in sample or b"7z\xBC\xAF\x27\x1C" in sample)):
+        findings.append(Finding("self-extracting-archive", "Executable contains embedded archive signature", "medium", str(path.name)))
+    if suffix in {".iso", ".img"}:
+        findings.append(Finding("disk-image-archive", "Disk image can contain hidden executable content", "medium", suffix))
+    return findings
+
+
 def scan_zip(path: Path) -> list[Finding]:
     try:
         with zipfile.ZipFile(path) as archive:
@@ -1411,8 +1562,8 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
             and result.sha256.lower() not in cleanable_hashes
         ]
         if external_hits:
-            return ["No built-in known-bad files found to remove. External --known-bad hits are report-only and were not cleaned."]
-        return ["No built-in known-bad files found to remove."]
+            return ["No cleanable known-bad files found to remove. External --known-bad hits require --clean-user-hashes."]
+        return ["No cleanable known-bad files found to remove."]
 
     if platform.system() == "Windows":
         report.extend(stop_known_bad_processes(known_bad_paths, cleanable_hashes))
@@ -1557,6 +1708,9 @@ def trusted_windows_executable(*relative_parts: str) -> Path | None:
 
 
 def authenticode_status(path: Path) -> tuple[str, str]:
+    cache_key = signature_cache_key(path)
+    if cache_key and cache_key in AUTHENTICODE_CACHE:
+        return AUTHENTICODE_CACHE[cache_key]
     powershell = trusted_windows_executable("WindowsPowerShell", "v1.0", "powershell.exe")
     if not powershell:
         return "UnknownError", "trusted powershell.exe was not found under System32"
@@ -1578,13 +1732,35 @@ def authenticode_status(path: Path) -> tuple[str, str]:
     if not output:
         return "UnknownError", completed.stderr.strip()
     status, _, signer = output[-1].partition("|")
-    return status.strip(), signer.strip()
+    result = (status.strip(), signer.strip())
+    if cache_key and should_cache_signature_result(path, result[0], result[1]):
+        AUTHENTICODE_CACHE[cache_key] = result
+    return result
+
+
+def signature_cache_key(path: Path) -> tuple[str, int, int] | None:
+    try:
+        info = path.stat()
+        return (normalize_filesystem_path(path), int(info.st_mtime_ns), int(info.st_size))
+    except OSError:
+        return None
+
+
+def should_cache_signature_result(path: Path, status: str, signer: str) -> bool:
+    if status != "Valid" or "microsoft" not in signer.lower():
+        return False
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    system32 = normalize_filesystem_path(Path(system_root) / "System32")
+    return path_is_under(normalize_filesystem_path(path), system32)
 
 
 def scan_startup_locations() -> list[ScanResult]:
     results: list[ScanResult] = []
     results.extend(scan_startup_folders())
     results.extend(scan_registry_run_keys())
+    results.extend(scan_scheduled_tasks())
+    results.extend(scan_browser_extensions())
+    results.extend(scan_wmi_event_consumers())
     return results
 
 
@@ -1637,6 +1813,188 @@ def scan_registry_run_keys() -> list[ScanResult]:
                     index += 1
         except OSError:
             continue
+    return results
+
+
+def scan_scheduled_tasks() -> list[ScanResult]:
+    if platform.system() != "Windows":
+        return []
+    task_root = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "Tasks"
+    if not task_root.exists():
+        return []
+    results: list[ScanResult] = []
+    stack = [task_root]
+    inspected = 0
+    while stack and inspected < 5000:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        inspected += 1
+                        data = path.read_bytes()[:MAX_ARCHIVE_TEXT_ENTRY_BYTES]
+                    except OSError:
+                        continue
+                    text = data.decode("utf-16", errors="ignore") if data.startswith((b"\xff\xfe", b"\xfe\xff")) else data.decode("utf-8", errors="ignore")
+                    command = first_xml_text(text, "Command")
+                    arguments = first_xml_text(text, "Arguments")
+                    if not command and not arguments:
+                        continue
+                    detail = " ".join(part for part in (command, arguments) if part).strip()
+                    relative = path.relative_to(task_root) if path_is_relative_to(path, task_root) else path.name
+                    if suspicious_startup_command(detail):
+                        result = ScanResult(path=f"scheduled-task:{relative}", kind="scheduled-task")
+                        result.findings.append(Finding("scheduled-task-suspicious-action", "Scheduled task runs a suspicious command", "high", detail))
+                        results.append(result)
+                    elif "microsoft" not in str(relative).lower():
+                        result = ScanResult(path=f"scheduled-task:{relative}", kind="scheduled-task")
+                        result.findings.append(Finding("scheduled-task-entry", "Non-Microsoft scheduled task starts automatically", "low", detail))
+                        results.append(result)
+        except OSError:
+            continue
+    return results
+
+
+def first_xml_text(text: str, tag: str) -> str:
+    match = re.search(rf"(?is)<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}>", text)
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group(1)).strip()
+
+
+def path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def scan_browser_extensions() -> list[ScanResult]:
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if not local_appdata:
+        return []
+    roots = [
+        Path(local_appdata) / "Google" / "Chrome" / "User Data",
+        Path(local_appdata) / "Microsoft" / "Edge" / "User Data",
+        Path(local_appdata) / "BraveSoftware" / "Brave-Browser" / "User Data",
+    ]
+    results: list[ScanResult] = []
+    for user_data in roots:
+        if not user_data.exists():
+            continue
+        for profile in browser_profiles(user_data):
+            extension_root = profile / "Extensions"
+            if not extension_root.exists():
+                continue
+            for extension_dir in extension_root.iterdir():
+                if not extension_dir.is_dir():
+                    continue
+                manifest_path = newest_manifest(extension_dir)
+                if not manifest_path:
+                    continue
+                result = analyze_extension_manifest(extension_dir.name, manifest_path)
+                if result:
+                    results.append(result)
+    return results
+
+
+def browser_profiles(user_data: Path) -> Iterable[Path]:
+    for child in user_data.iterdir():
+        if child.is_dir() and (child.name == "Default" or child.name.startswith("Profile ")):
+            yield child
+
+
+def newest_manifest(extension_dir: Path) -> Path | None:
+    manifests = [path / "manifest.json" for path in extension_dir.iterdir() if path.is_dir() and (path / "manifest.json").exists()]
+    manifests.extend([extension_dir / "manifest.json"] if (extension_dir / "manifest.json").exists() else [])
+    if not manifests:
+        return None
+    return max(manifests, key=lambda item: item.stat().st_mtime)
+
+
+def analyze_extension_manifest(extension_id: str, manifest_path: Path) -> ScanResult | None:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    permissions = extension_permissions(manifest)
+    risky_permissions = sorted(permissions.intersection({"cookies", "webRequest", "webRequestBlocking", "nativeMessaging", "tabs", "proxy", "downloads", "management", "debugger", "clipboardRead", "scripting"}))
+    broad_host_access = any(value in permissions for value in {"<all_urls>", "http://*/*", "https://*/*", "*://*/*"})
+    sideloaded = not manifest.get("update_url")
+    findings: list[Finding] = []
+    if risky_permissions and broad_host_access:
+        findings.append(Finding("browser-extension-risky-permissions", "Browser extension has broad and risky permissions", "high", f"id={extension_id}, permissions={', '.join(risky_permissions)}"))
+    elif risky_permissions or broad_host_access:
+        findings.append(Finding("browser-extension-review", "Browser extension has permissions worth reviewing", "medium", f"id={extension_id}, permissions={', '.join(sorted(permissions))[:300]}"))
+    if sideloaded and (risky_permissions or broad_host_access):
+        findings.append(Finding("browser-extension-sideloaded", "Browser extension appears sideloaded or locally installed", "medium", f"id={extension_id}, manifest={manifest_path}"))
+    if not findings:
+        return None
+    result = ScanResult(path=str(manifest_path), kind="browser-extension")
+    result.findings.extend(findings)
+    return result
+
+
+def extension_permissions(manifest: dict) -> set[str]:
+    permissions: set[str] = set()
+    for key in ("permissions", "optional_permissions", "host_permissions", "optional_host_permissions"):
+        values = manifest.get(key)
+        if isinstance(values, list):
+            permissions.update(str(value) for value in values)
+    for item in manifest.get("content_scripts", []) if isinstance(manifest.get("content_scripts"), list) else []:
+        if isinstance(item, dict) and isinstance(item.get("matches"), list):
+            permissions.update(str(value) for value in item["matches"])
+    externally_connectable = manifest.get("externally_connectable")
+    if isinstance(externally_connectable, dict) and isinstance(externally_connectable.get("matches"), list):
+        permissions.update(str(value) for value in externally_connectable["matches"])
+    return permissions
+
+
+def scan_wmi_event_consumers() -> list[ScanResult]:
+    if platform.system() != "Windows":
+        return []
+    powershell = trusted_windows_executable("WindowsPowerShell", "v1.0", "powershell.exe")
+    if not powershell:
+        return []
+    script = (
+        "$items=@();"
+        "Get-WmiObject -Namespace root\\subscription -Class __EventFilter -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $items += [pscustomobject]@{Class=$_.__CLASS;Name=$_.Name;Detail=$_.Query} };"
+        "Get-WmiObject -Namespace root\\subscription -Class CommandLineEventConsumer -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $items += [pscustomobject]@{Class=$_.__CLASS;Name=$_.Name;Detail=$_.CommandLineTemplate} };"
+        "Get-WmiObject -Namespace root\\subscription -Class ActiveScriptEventConsumer -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $items += [pscustomobject]@{Class=$_.__CLASS;Name=$_.Name;Detail=$_.ScriptText} };"
+        "$items | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run([str(powershell), "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=12, check=False)
+    except Exception:  # noqa: BLE001 - advisory collector only.
+        return []
+    if not completed.stdout.strip():
+        return []
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    items = data if isinstance(data, list) else [data]
+    results: list[ScanResult] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or "(unnamed)")
+        detail = str(item.get("Detail") or "")
+        class_name = str(item.get("Class") or "WMI")
+        result = ScanResult(path=f"wmi:{class_name}:{name}", kind="wmi-persistence")
+        severity = "high" if suspicious_startup_command(detail) else "medium"
+        result.findings.append(Finding("wmi-event-consumer", "WMI subscription persistence exists", severity, detail or class_name))
+        results.append(result)
     return results
 
 
