@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -24,11 +25,12 @@ from pathlib import PurePosixPath
 from typing import Iterable
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SEVERITY_SCORE = {"info": 0, "low": 1, "medium": 3, "high": 6, "critical": 10}
 MAX_TEXT_SCAN_BYTES = 1_000_000
 ENTROPY_SAMPLE_CHUNK_BYTES = 128 * 1024
 MAX_ARCHIVE_ENTRIES = 1_000
+MAX_ARCHIVE_CONTENT_CANDIDATES = 200
 MAX_ARCHIVE_TEXT_ENTRY_BYTES = 300_000
 MAX_ARCHIVE_FINDINGS = 80
 DEFAULT_EXCLUDED_DIRS = {"reports", "quarantine", "__pycache__", ".git", ".venv", "venv"}
@@ -191,12 +193,34 @@ EXPECTED_FILE_TYPES_BY_EXTENSION = {
 }
 
 
-class RuleSet:
-    def __init__(self, rules: list[tuple[str, str, str, re.Pattern[bytes]]]) -> None:
-        self.rules = rules
+@dataclass(frozen=True)
+class ContentRule:
+    rule_id: str
+    title: str
+    severity: str
+    regex: re.Pattern[bytes]
+    remediation: str = "Review the matched script behavior and verify the file source before running it."
 
-    def __iter__(self) -> Iterable[tuple[str, str, str, re.Pattern[bytes]]]:
+
+class RuleSet:
+    def __init__(self, rules: Iterable[ContentRule | tuple[str, str, str, re.Pattern[bytes]] | tuple[str, str, str, re.Pattern[bytes], str]]) -> None:
+        self.rules: list[ContentRule] = []
+        for rule in rules:
+            if isinstance(rule, ContentRule):
+                self.rules.append(rule)
+                continue
+            if len(rule) == 4:
+                rule_id, title, severity, regex = rule
+                remediation = "Review the matched script behavior and verify the file source before running it."
+            else:
+                rule_id, title, severity, regex, remediation = rule
+            self.rules.append(ContentRule(rule_id, title, severity, regex, remediation))
+
+    def __iter__(self) -> Iterable[ContentRule]:
         return iter(self.rules)
+
+    def extend(self, rules: Iterable[ContentRule]) -> None:
+        self.rules.extend(rules)
 
 SUSPICIOUS_NAME_PATTERNS = [
     re.compile(r"(?i)\bmr\s*beast\b|\bmrbeast\b"),
@@ -263,6 +287,7 @@ class Finding:
     severity: str
     detail: str
     evidence: str | None = None
+    remediation: str | None = None
 
 
 @dataclass
@@ -338,6 +363,7 @@ def finding_to_dict(finding: Finding, *, redact: bool = True) -> dict[str, str |
         "severity": output_text(finding.severity, redact=redact),
         "detail": output_text(finding.detail, redact=redact),
         "evidence": output_text(finding.evidence, redact=redact) if finding.evidence else None,
+        "remediation": output_text(finding.remediation, redact=redact) if finding.remediation else None,
     }
 
 
@@ -411,7 +437,7 @@ class Scanner:
     def scan_paths(self, paths: Iterable[Path]) -> ScanSummary:
         started = datetime.now()
         if self.verbose:
-            say("Loading targets", "Finding files below size limit plus risky oversized files", "cyan")
+            say("Loading targets", "Finding files for metadata checks; content scan size limit is applied later", "cyan")
         files, skipped = collect_files(paths, self.max_bytes)
         if self.verbose:
             say("Loaded", f"{len(files)} file(s), skipped {skipped}", "green")
@@ -455,22 +481,32 @@ class Scanner:
             suffix = path.suffix.lower()
             result.file_type = detect_file_type(path, sample)
 
-            if result.sha256.lower() in self.known_good:
-                return result
+            trusted_hash = result.sha256.lower() in self.known_good
+            if trusted_hash:
+                result.findings.append(
+                    Finding(
+                        "trusted-hash",
+                        "File hash is present in known-good allowlist",
+                        "info",
+                        result.sha256,
+                        remediation="Keep the allowlist small and periodically re-verify trusted files from their original source.",
+                    )
+                )
             if result.sha256.lower() in self.known_bad:
                 detail = BUILTIN_KNOWN_BAD_DETAILS.get(result.sha256.lower(), result.sha256)
-                result.findings.append(Finding("known-bad-hash", "Known malicious hash", "critical", detail))
+                result.findings.append(Finding("known-bad-hash", "Known malicious hash", "critical", detail, remediation="Disconnect from the network if compromise is suspected, then quarantine or delete only after verifying the hash source."))
 
             self.scan_file_shape(path, result, info.st_mtime, suffix)
+            result.findings.extend(scan_basic_document_content(path, sample, result.file_type))
             if result.size and result.size > self.max_bytes and should_queue_oversized_file(path):
-                result.findings.append(Finding("oversized-risky-file", "Risky file exceeds content scan size limit", "low", f"size={format_bytes(result.size)}, limit={format_bytes(self.max_bytes)}"))
+                result.findings.append(Finding("oversized-risky-file", "Risky file exceeds content scan size limit", "low", f"size={format_bytes(result.size)}, limit={format_bytes(self.max_bytes)}", remediation="Inspect with a full antivirus scan or increase --max-mb for a deeper content scan."))
 
             if self.inspect_archives and should_inspect_archive(suffix, result.file_type):
                 result.findings.extend(scan_zip(path))
             elif self.inspect_archives and should_report_unsupported_archive(suffix, result.file_type):
                 result.findings.extend(scan_unsupported_archive(path, result.file_type, sample))
 
-            if should_scan_content(path, result.size or 0, result.file_type, include_source=self.include_source):
+            if not trusted_hash and should_scan_content(path, min(result.size or 0, len(sample)), result.file_type, include_source=self.include_source):
                 result.findings.extend(scan_content_bytes(sample))
 
             if should_check_entropy(suffix, result.file_type):
@@ -489,7 +525,7 @@ class Scanner:
 
     def scan_file_shape(self, path: Path, result: ScanResult, mtime: float, suffix: str) -> None:
         if suffix in DANGEROUS_EXTENSIONS:
-            result.findings.append(Finding("runnable-file", "Runnable file type", "medium", suffix))
+            result.findings.append(Finding("runnable-file", "Runnable file type", "medium", suffix, remediation="Run only if you expected this executable/script and trust its publisher or source."))
 
         if suffix in SOURCE_CODE_EXTENSIONS and (self.include_source or is_risky_location(path) or suffix == ".pyw"):
             severity = "medium" if is_risky_location(path) or suffix == ".pyw" else "low"
@@ -541,7 +577,7 @@ class Scanner:
             result.findings.append(Finding("risky-location", "Runnable file is in a user-writable or download location", "medium", str(path.parent)))
 
         if suffix in SIGNED_APP_EXTENSIONS and path.name.lower() in {"setup.exe", "installer.exe", "update.exe", "security.exe", "verify.exe"} and is_risky_location(path):
-            result.findings.append(Finding("generic-installer-name", "Generic installer name in risky location", "medium", path.name))
+            result.findings.append(Finding("generic-installer-name", "Generic installer name in risky location", "low", path.name, remediation="Use this as supporting context; generic installer names are common but should match the expected download."))
 
         for pattern in suspicious_name_hits(path):
             result.findings.append(Finding("suspicious-name", "Suspicious scam-like filename", "medium", pattern))
@@ -566,6 +602,16 @@ class Scanner:
                     "Unsigned packed app in risky location",
                     "critical",
                     "Unsigned, high-entropy runnable file located in a user-writable or download location",
+                )
+            )
+        if {"generic-installer-name", "risky-location", "new-runnable"}.issubset(rule_ids) and "compound-new-generic-installer" not in rule_ids:
+            result.findings.append(
+                Finding(
+                    "compound-new-generic-installer",
+                    "New generic installer in risky location",
+                    "medium",
+                    "Generic installer naming combined with recent modification time and risky location",
+                    remediation="Confirm the download origin and signature before running the installer.",
                 )
             )
 
@@ -601,7 +647,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup", action="store_true", help="Inspect Windows startup folders and registry Run keys.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--csv", action="store_true", help="Print findings as CSV.")
-    parser.add_argument("--max-mb", type=positive_int, default=75, help="Skip files larger than this size. Default: 75.")
+    parser.add_argument("--sarif", type=Path, help="Write a SARIF 2.1.0 report for code-scanning or CI ingestion.")
+    parser.add_argument("--baseline", type=Path, help="Compare against a previous CLN JSON report and only keep new matching findings.")
+    parser.add_argument("--rules", type=Path, help="Load extra content rules from a structured JSON rule file.")
+    parser.add_argument("--yara-rules", type=Path, help="Run optional yara-python rules from this file or directory when yara-python is installed.")
+    parser.add_argument("--max-mb", type=positive_int, default=75, help="Content scan size limit in MB. Metadata and magic bytes are still inspected for larger files. Default: 75.")
     parser.add_argument("--workers", type=worker_count, default=None, help="Parallel worker count from 1 to 64. Default: auto.")
     parser.add_argument("--known-bad", type=Path, help="JSON array of known bad SHA-256 hashes.")
     parser.add_argument("--known-good", type=Path, help="JSON array of trusted SHA-256 hashes.")
@@ -633,6 +683,8 @@ def main(argv: list[str] | None = None) -> int:
     paths = choose_paths(args)
     verbose = not args.quiet and not args.json and not args.csv
     user_known_bad = load_hashes(args.known_bad)
+    if args.rules:
+        CONTENT_RULES.extend(load_content_rules(args.rules))
     cleanable_hashes = BUILTIN_KNOWN_BAD_SHA256 | (user_known_bad if args.clean_user_hashes else set())
     if verbose:
         print_banner()
@@ -650,6 +702,8 @@ def main(argv: list[str] | None = None) -> int:
         recent_days=args.recent_days,
     )
     summary = scanner.scan_paths(paths)
+    if args.yara_rules:
+        apply_yara_rules(summary, args.yara_rules)
     if args.startup:
         if verbose:
             say("Startup", "Checking folders and Run/RunOnce registry entries", "cyan")
@@ -661,6 +715,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.clean:
         cleanup_report = clean_known_bad(summary, args.quarantine_dir, delete=args.delete, cleanable_hashes=cleanable_hashes)
 
+    if args.baseline:
+        summary = filter_baseline(summary, args.baseline, redact=redact_outputs)
+
     report_path: Path | None = None
     report_error: str | None = None
     try:
@@ -668,12 +725,21 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - scan results are more important than report persistence.
         report_error = f"{type(exc).__name__}: {exc}"
 
+    sarif_error: str | None = None
+    if args.sarif:
+        try:
+            write_sarif_report(summary, args.sarif, redact=redact_outputs)
+        except Exception as exc:  # noqa: BLE001
+            sarif_error = f"{type(exc).__name__}: {exc}"
+
     if args.json:
         data = summary.to_dict(redact=redact_outputs)
         data["redacted"] = redact_outputs
         data["cleanup"] = [output_text(line, redact=redact_outputs) for line in cleanup_report]
         data["report_path"] = output_text(report_path, redact=redact_outputs) if report_path else None
         data["report_error"] = output_text(report_error, redact=redact_outputs) if report_error else None
+        data["sarif_path"] = output_text(args.sarif, redact=redact_outputs) if args.sarif and not sarif_error else None
+        data["sarif_error"] = output_text(sarif_error, redact=redact_outputs) if sarif_error else None
         print(json.dumps(data, indent=2))
     elif args.csv:
         print(summary_to_csv(summary, redact=redact_outputs), end="")
@@ -687,6 +753,9 @@ def main(argv: list[str] | None = None) -> int:
         if report_error:
             print("")
             print(color(f"Report warning: could not save text report: {output_text(report_error, redact=redact_outputs)}", "yellow"))
+        if sarif_error:
+            print("")
+            print(color(f"SARIF warning: could not save SARIF report: {output_text(sarif_error, redact=redact_outputs)}", "yellow"))
         print("")
         if report_path:
             print(color(f"Scan complete. Review: {output_text(report_path, redact=redact_outputs)}", "green"))
@@ -780,6 +849,150 @@ def summary_to_csv(summary: ScanSummary, *, redact: bool = True) -> str:
     return output.getvalue()
 
 
+def write_sarif_report(summary: ScanSummary, path: Path, *, redact: bool = True) -> None:
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    severity_level = {"critical": "error", "high": "error", "medium": "warning", "low": "note", "info": "note"}
+    for result in summary.results:
+        for finding in result.findings:
+            rules.setdefault(
+                finding.rule_id,
+                {
+                    "id": finding.rule_id,
+                    "name": finding.title,
+                    "shortDescription": {"text": finding.title},
+                    "help": {"text": finding.remediation or "Review the CLN finding and verify the file source."},
+                    "properties": {"severity": finding.severity},
+                },
+            )
+            results.append(
+                {
+                    "ruleId": finding.rule_id,
+                    "level": severity_level.get(finding.severity, "warning"),
+                    "message": {"text": output_text(f"{finding.title}: {finding.detail}", redact=redact)},
+                    "locations": [
+                        {
+                            "physicalLocation": {
+                                "artifactLocation": {"uri": output_text(result.path, redact=redact)},
+                                "region": {"startLine": 1},
+                            }
+                        }
+                    ],
+                }
+            )
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "CLN",
+                        "version": VERSION,
+                        "informationUri": "https://github.com/",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+    secure_write_text_file(path, json.dumps(sarif, indent=2))
+
+
+def filter_baseline(summary: ScanSummary, baseline_path: Path, *, redact: bool = True) -> ScanSummary:
+    data = json.loads(baseline_path.read_text(encoding="utf-8"))
+    old_keys: set[tuple[str, str, str | None]] = set()
+    for hit in data.get("hits", []):
+        path = str(hit.get("path", ""))
+        sha256_value = hit.get("sha256")
+        for finding in hit.get("findings", []):
+            old_keys.add((path, str(finding.get("rule_id", "")), sha256_value))
+    filtered_results: list[ScanResult] = []
+    for result in summary.results:
+        if not result.findings:
+            if result.error:
+                filtered_results.append(result)
+            continue
+        kept = [
+            finding
+            for finding in result.findings
+            if (output_text(result.path, redact=redact), finding.rule_id, output_text(result.sha256, redact=redact) if result.sha256 else None) not in old_keys
+        ]
+        if kept or result.error:
+            filtered_results.append(
+                ScanResult(
+                    path=result.path,
+                    kind=result.kind,
+                    sha256=result.sha256,
+                    size=result.size,
+                    modified=result.modified,
+                    file_type=result.file_type,
+                    findings=kept,
+                    error=result.error,
+                )
+            )
+    return ScanSummary(
+        scanned_files=summary.scanned_files,
+        skipped_files=summary.skipped_files,
+        results=filtered_results,
+        denied_files=summary.denied_files,
+        vanished_files=summary.vanished_files,
+        elapsed_seconds=summary.elapsed_seconds,
+    )
+
+
+def apply_yara_rules(summary: ScanSummary, rules_path: Path) -> None:
+    try:
+        import yara  # type: ignore[import-not-found]
+    except ImportError:
+        warning = Finding(
+            "yara-unavailable",
+            "YARA rules were requested but yara-python is not installed",
+            "low",
+            str(rules_path),
+            remediation="Install optional dependency yara-python, then rerun with --yara-rules.",
+        )
+        summary.results.append(ScanResult(path=str(rules_path), kind="yara", findings=[warning]))
+        return
+
+    try:
+        if rules_path.is_dir():
+            filepaths = {str(path): str(path) for path in rules_path.rglob("*.yar")}
+            filepaths.update({str(path): str(path) for path in rules_path.rglob("*.yara")})
+            rules = yara.compile(filepaths=filepaths)
+        else:
+            rules = yara.compile(filepath=str(rules_path))
+    except Exception as exc:  # noqa: BLE001
+        summary.results.append(
+            ScanResult(
+                path=str(rules_path),
+                kind="yara",
+                findings=[Finding("yara-compile-error", "YARA rules could not be compiled", "medium", f"{type(exc).__name__}: {exc}")],
+            )
+        )
+        return
+
+    for result in summary.results:
+        if result.kind != "file" or result.error:
+            continue
+        try:
+            matches = rules.match(result.path)
+        except Exception as exc:  # noqa: BLE001
+            result.findings.append(Finding("yara-scan-error", "YARA scan failed for file", "low", f"{type(exc).__name__}: {exc}"))
+            continue
+        for match in matches:
+            result.findings.append(
+                Finding(
+                    "yara-match",
+                    f"YARA match: {match.rule}",
+                    "high",
+                    getattr(match, "namespace", "") or str(rules_path),
+                    remediation="Treat YARA matches as high-signal and validate with your incident-response workflow.",
+                )
+            )
+
+
 def print_report(summary: ScanSummary, paths: list[Path], signatures_enabled: bool, *, redact: bool = True) -> None:
     print("")
     print(color(f"CLN Scanner {VERSION}", "bold"))
@@ -830,6 +1043,8 @@ def print_report(summary: ScanSummary, paths: list[Path], signatures_enabled: bo
             print(f"    {output_text(finding.detail, redact=redact)}")
             if finding.evidence:
                 print(f"    Evidence: {output_text(finding.evidence, redact=redact)}")
+            if finding.remediation:
+                print(f"    Remediation: {output_text(finding.remediation, redact=redact)}")
 
 
 def write_text_report(
@@ -899,6 +1114,8 @@ def write_text_report(
                 )
                 if finding.evidence:
                     lines.append(f"    Evidence: {output_text(finding.evidence, redact=redact)}")
+                if finding.remediation:
+                    lines.append(f"    Remediation: {output_text(finding.remediation, redact=redact)}")
     else:
         lines.extend(["Findings", "  No suspicious files found."])
 
@@ -915,8 +1132,7 @@ def write_text_report(
             "",
         ]
     )
-    with report_path.open("x", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
+    secure_write_text_file(report_path, "\n".join(lines))
     return report_path
 
 
@@ -926,11 +1142,8 @@ def collect_files(paths: Iterable[Path], max_bytes: int) -> tuple[list[Path], in
     for root in paths:
         try:
             if root.is_file():
-                info = root.stat()
-                if info.st_size <= max_bytes or should_queue_oversized_file(root):
-                    files.append(root)
-                else:
-                    skipped += 1
+                root.stat()
+                files.append(root)
                 continue
             if not root.is_dir():
                 skipped += 1
@@ -955,11 +1168,8 @@ def collect_files(paths: Iterable[Path], max_bytes: int) -> tuple[list[Path], in
                                 continue
                             if is_excluded_path(path):
                                 continue
-                            info = entry.stat(follow_symlinks=False)
-                            if info.st_size <= max_bytes or should_queue_oversized_file(path):
-                                files.append(path)
-                            else:
-                                skipped += 1
+                            entry.stat(follow_symlinks=False)
+                            files.append(path)
                         except OSError:
                             skipped += 1
             except OSError:
@@ -1001,13 +1211,98 @@ def load_hashes(path: Path | None) -> set[str]:
     if not path:
         return set()
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise ValueError(f"{path} must contain a JSON array of SHA-256 hashes")
-    hashes = {str(item).strip().lower() for item in data}
+    if isinstance(data, list):
+        hashes = {str(item).strip().lower() for item in data}
+    elif isinstance(data, dict):
+        schema = str(data.get("schema") or data.get("schema_version") or "")
+        if schema and schema not in {"cln-hash-list-v1", "1"}:
+            raise ValueError(f"{path} uses unsupported hash-list schema: {schema}")
+        hashes_value = data.get("hashes")
+        if not isinstance(hashes_value, list):
+            raise ValueError(f"{path} must contain a 'hashes' array")
+        if not data.get("description"):
+            raise ValueError(f"{path} structured hash list requires a description")
+        if not data.get("created_at") and not data.get("updated_at"):
+            raise ValueError(f"{path} structured hash list requires created_at or updated_at")
+        hashes = set()
+        for item in hashes_value:
+            if isinstance(item, dict):
+                hashes.add(str(item.get("sha256", "")).strip().lower())
+            else:
+                hashes.add(str(item).strip().lower())
+    else:
+        raise ValueError(f"{path} must contain a JSON array or structured hash-list object")
     bad_values = [item for item in hashes if not re.fullmatch(r"[a-f0-9]{64}", item)]
     if bad_values:
         raise ValueError(f"{path} contains invalid SHA-256 value(s): {', '.join(bad_values[:3])}")
     return hashes
+
+
+def load_content_rules(path: Path) -> list[ContentRule]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a structured JSON rule object")
+    schema = str(data.get("schema") or data.get("schema_version") or "")
+    if schema and schema not in {"cln-content-rules-v1", "1"}:
+        raise ValueError(f"{path} uses unsupported rule schema: {schema}")
+    rules_value = data.get("rules")
+    if not isinstance(rules_value, list):
+        raise ValueError(f"{path} must contain a rules array")
+    loaded: list[ContentRule] = []
+    for index, item in enumerate(rules_value):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path} rule #{index + 1} must be an object")
+        rule_id = str(item.get("id") or item.get("rule_id") or "").strip()
+        title = str(item.get("title") or rule_id).strip()
+        severity = str(item.get("severity") or "medium").strip().lower()
+        pattern = str(item.get("pattern") or "")
+        flags_text = str(item.get("flags") or "is")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rule_id):
+            raise ValueError(f"{path} rule #{index + 1} has an invalid id")
+        if severity not in SEVERITY_SCORE:
+            raise ValueError(f"{path} rule {rule_id} has invalid severity: {severity}")
+        flags = 0
+        if "i" in flags_text:
+            flags |= re.IGNORECASE
+        if "s" in flags_text:
+            flags |= re.DOTALL
+        if "m" in flags_text:
+            flags |= re.MULTILINE
+        try:
+            regex = re.compile(pattern.encode("utf-8"), flags)
+        except re.error as exc:
+            raise ValueError(f"{path} rule {rule_id} has invalid regex: {exc}") from exc
+        remediation = str(item.get("remediation") or "Review this rule match and verify the file source.")
+        loaded.append(ContentRule(rule_id, title, severity, regex, remediation))
+    return loaded
+
+
+def secure_write_text_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if platform.system() != "Windows":
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(text)
+    restrict_windows_file_acl(path)
+
+
+def restrict_windows_file_acl(path: Path) -> None:
+    if platform.system() != "Windows":
+        return
+    icacls = shutil.which("icacls")
+    if not icacls:
+        return
+    subprocess.run([icacls, str(path), "/inheritance:r"], capture_output=True, text=True, timeout=10, check=False)
+    user = os.environ.get("USERNAME")
+    if user:
+        subprocess.run([icacls, str(path), "/grant:r", f"{user}:F"], capture_output=True, text=True, timeout=10, check=False)
 
 
 def sha256_file(path: Path) -> str:
@@ -1241,11 +1536,18 @@ def scan_content_bytes(data: bytes) -> list[Finding]:
 
 def scan_content_rule_matches(data: bytes, detail: str) -> list[Finding]:
     findings: list[Finding] = []
-    for rule_id, title, severity, regex in CONTENT_RULES:
-        match = regex.search(data)
+    for rule in CONTENT_RULES:
+        match = rule.regex.search(data)
         if match:
-            findings.append(Finding(rule_id, title, severity, detail, describe_match(data, match.start(), match.end())))
+            if rule.rule_id == "long-base64-blob" and not base64_blob_has_execution_context(data, match.start(), match.end()):
+                continue
+            findings.append(Finding(rule.rule_id, rule.title, rule.severity, detail, describe_match(data, match.start(), match.end()), rule.remediation))
     return findings
+
+
+def base64_blob_has_execution_context(data: bytes, start: int, end: int) -> bool:
+    window = data[max(0, start - 500) : min(len(data), end + 500)].lower()
+    return any(token in window for token in (b"eval", b"iex", b"invoke-expression", b"frombase64string", b"atob", b"base64decode", b"encodedcommand"))
 
 
 def content_scan_views(data: bytes) -> Iterable[tuple[str, bytes]]:
@@ -1354,6 +1656,55 @@ def safe_excerpt(data: bytes, limit: int = 180) -> str:
     return text
 
 
+def scan_basic_document_content(path: Path, sample: bytes, file_type: str | None) -> list[Finding]:
+    suffix = path.suffix.lower()
+    findings: list[Finding] = []
+    if file_type == "pdf-document" or suffix == ".pdf":
+        for rule_id, title, pattern in (
+            ("pdf-javascript", "PDF contains JavaScript action", rb"(?is)/(?:JavaScript|JS)\b"),
+            ("pdf-launch-action", "PDF contains Launch/OpenAction behavior", rb"(?is)/(?:Launch|OpenAction|AA)\b"),
+        ):
+            match = re.search(pattern, sample)
+            if match:
+                findings.append(
+                    Finding(
+                        rule_id,
+                        title,
+                        "medium",
+                        str(path.name),
+                        describe_match(sample, match.start(), match.end()),
+                        "Open the PDF only in a sandboxed viewer and verify it with a dedicated PDF analysis tool.",
+                    )
+                )
+    if file_type == "compound-document" or suffix in {".doc", ".xls", ".ppt", ".msi"}:
+        lowered = sample.lower()
+        if b"vba" in lowered or b"macros" in lowered or b"attrib" in lowered:
+            findings.append(
+                Finding(
+                    "legacy-office-macro-indicator",
+                    "Legacy Office/OLE file has macro indicators",
+                    "medium",
+                    str(path.name),
+                    None,
+                    "Open only with macros disabled and inspect with olevba or an enterprise malware scanner.",
+                )
+            )
+    if file_type == "windows-shortcut" or suffix == ".lnk":
+        text = sample.decode("utf-16-le", errors="ignore") + "\n" + sample.decode("latin-1", errors="ignore")
+        if re.search(r"(?is)\b(?:powershell|pwsh|mshta|wscript|cscript|rundll32|cmd)(?:\.exe)?\b", text):
+            findings.append(
+                Finding(
+                    "shortcut-suspicious-target",
+                    "Shortcut references a suspicious command interpreter",
+                    "high",
+                    str(path.name),
+                    safe_excerpt(text.encode("utf-8", errors="replace")),
+                    "Inspect the shortcut target and arguments before opening it.",
+                )
+            )
+    return findings
+
+
 def scan_unsupported_archive(path: Path, file_type: str | None, sample: bytes) -> list[Finding]:
     suffix = path.suffix.lower()
     findings = [
@@ -1386,14 +1737,15 @@ def scan_zip_archive(archive: zipfile.ZipFile) -> list[Finding]:
     total_size = sum(max(info.file_size, 0) for info in infos)
     total_compressed = sum(max(info.compress_size, 0) for info in infos)
     if len(infos) > MAX_ARCHIVE_ENTRIES:
-        add_archive_finding(findings, seen, Finding("large-archive", "Archive has many entries", "low", f"{len(infos)} entries; inspected first {MAX_ARCHIVE_ENTRIES}"))
+        add_archive_finding(findings, seen, Finding("large-archive", "Archive has many entries", "low", f"{len(infos)} entries; scanned all entry names and selected content candidates"))
     if total_size >= 500 * 1024 * 1024:
         add_archive_finding(findings, seen, Finding("huge-archive", "Archive expands to a very large size", "medium", format_bytes(total_size)))
     if total_compressed and total_size / total_compressed >= 100 and total_size >= 50 * 1024 * 1024:
         ratio = total_size / total_compressed
         add_archive_finding(findings, seen, Finding("zip-bomb-shape", "Archive has a suspicious compression ratio", "high", f"expanded={format_bytes(total_size)}, compressed={format_bytes(total_compressed)}, ratio={ratio:.1f}x"))
 
-    for info in infos[:MAX_ARCHIVE_ENTRIES]:
+    content_candidates: list[tuple[int, zipfile.ZipInfo, str, str]] = []
+    for info in infos:
         name = info.filename
         if not name or name.endswith("/"):
             continue
@@ -1424,12 +1776,21 @@ def scan_zip_archive(archive: zipfile.ZipFile) -> list[Finding]:
             add_archive_finding(findings, seen, Finding("office-macro-project", "Office document contains macro project data", "high", normalized))
 
         if is_office_external_relationship_candidate(normalized, info.file_size):
+            content_candidates.append((archive_entry_priority(normalized, suffix, info.file_size), info, normalized, suffix))
+
+        if should_scan_archive_entry_content(normalized, suffix, info.file_size):
+            content_candidates.append((archive_entry_priority(normalized, suffix, info.file_size), info, normalized, suffix))
+        elif suffix in ZIP_CONTAINER_EXTENSIONS and 0 < info.file_size <= 2_000_000:
+            content_candidates.append((archive_entry_priority(normalized, suffix, info.file_size), info, normalized, suffix))
+
+    content_candidates.sort(key=lambda item: item[0])
+    for _, info, normalized, suffix in content_candidates[:MAX_ARCHIVE_CONTENT_CANDIDATES]:
+        if is_office_external_relationship_candidate(normalized, info.file_size):
             data = read_zip_entry_sample(archive, info, findings, seen, normalized)
             if data is None:
                 continue
             for finding in scan_office_relationships(normalized, data):
                 add_archive_finding(findings, seen, finding)
-
         if should_scan_archive_entry_content(normalized, suffix, info.file_size):
             data = read_zip_entry_sample(archive, info, findings, seen, normalized)
             if data is None:
@@ -1438,9 +1799,44 @@ def scan_zip_archive(archive: zipfile.ZipFile) -> list[Finding]:
                 add_archive_finding(
                     findings,
                     seen,
-                    Finding(f"archive-{finding.rule_id}", f"Archive entry: {finding.title}", finding.severity, normalized, finding.evidence),
+                    Finding(f"archive-{finding.rule_id}", f"Archive entry: {finding.title}", finding.severity, normalized, finding.evidence, finding.remediation),
                 )
+        if suffix in ZIP_CONTAINER_EXTENSIONS:
+            data = read_zip_entry_sample(archive, info, findings, seen, normalized, limit=2_000_000)
+            if data:
+                nested_findings = scan_nested_zip_bytes(data, normalized)
+                for finding in nested_findings:
+                    add_archive_finding(findings, seen, finding)
     return findings
+
+
+def archive_entry_priority(name: str, suffix: str, size: int) -> int:
+    lowered = name.lower()
+    score = 50
+    if suffix in ARCHIVE_HIGH_RISK_EXTENSIONS:
+        score -= 30
+    if suffix in ZIP_CONTAINER_EXTENSIONS:
+        score -= 25
+    if any(word in lowered for word in ("payload", "setup", "install", "update", "run", "token", "wallet", "password")):
+        score -= 15
+    if suffix in SOURCE_CODE_EXTENSIONS:
+        score += 10
+    if size > MAX_ARCHIVE_TEXT_ENTRY_BYTES:
+        score += 20
+    return score
+
+
+def scan_nested_zip_bytes(data: bytes, parent_name: str) -> list[Finding]:
+    if not data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as nested:
+            return [
+                Finding(f"nested-{finding.rule_id}", f"Nested archive: {finding.title}", finding.severity, f"{parent_name}!/{finding.detail}", finding.evidence, finding.remediation)
+                for finding in scan_zip_archive(nested)
+            ]
+    except (OSError, zipfile.BadZipFile):
+        return [Finding("nested-bad-zip", "Nested archive could not be parsed", "low", parent_name)]
 
 
 def add_archive_finding(findings: list[Finding], seen: set[tuple[str, str, str]], finding: Finding) -> None:
@@ -1573,8 +1969,17 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
             report.append(f"Already gone: {path}")
             continue
         try:
-            current_hash = sha256_file(path).lower()
-            if current_hash not in cleanable_hashes:
+            current_hash, stable = hash_with_stability_check(path)
+            current_hash = current_hash.lower()
+            if not stable:
+                report.append(f"Skipped unstable file, metadata changed while hashing: {path}")
+                continue
+            latest_hash, latest_stable = hash_with_stability_check(path)
+            latest_hash = latest_hash.lower()
+            if not latest_stable or latest_hash != current_hash:
+                report.append(f"Skipped changed file, hash changed before cleanup: {path}")
+                continue
+            if latest_hash not in cleanable_hashes:
                 report.append(f"Skipped changed file, hash no longer matches known bad: {path}")
                 continue
             if delete:
@@ -1582,7 +1987,7 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
                 report.append(f"Deleted known-bad file: {path}")
             else:
                 quarantine_dir.mkdir(parents=True, exist_ok=True)
-                destination = unique_quarantine_path(quarantine_dir, path, current_hash)
+                destination = unique_quarantine_path(quarantine_dir, path, latest_hash)
                 path.replace(destination)
                 report.append(f"Quarantined known-bad file: {path} -> {destination}")
         except Exception as exc:  # noqa: BLE001 - cleanup should report each failure.
@@ -1591,6 +1996,22 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
     if platform.system() == "Windows":
         report.extend(remove_known_bad_startup_entries(cleanable_hashes))
     return report
+
+
+def hash_with_stability_check(path: Path) -> tuple[str, bool]:
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = path.stat()
+    stable = (
+        before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+        and getattr(before, "st_ino", 0) == getattr(after, "st_ino", 0)
+        and getattr(before, "st_dev", 0) == getattr(after, "st_dev", 0)
+    )
+    return digest.hexdigest(), stable
 
 
 def unique_quarantine_path(quarantine_dir: Path, source: Path, sha256_value: str) -> Path:
