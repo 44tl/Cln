@@ -6,10 +6,16 @@ CLN is a simple, single-file Windows-focused scanner for suspicious downloads, w
 
 It is designed to boot fast, show what it is doing, and avoid expensive work by default. It makes no network calls and does not clean anything unless you ask it to.
 
-The scanner is only `cln.py`. There is no install step and no package to import.
+The scanner is only `cln.py`. There is no install step for the default scanner and no package to import.
 
 ```powershell
 python .\cln.py
+```
+
+Optional integrations such as YARA support are listed in `requirements.txt`:
+
+```powershell
+python -m pip install -r requirements.txt
 ```
 
 ## Run
@@ -54,6 +60,19 @@ Output CSV for spreadsheet review:
 python .\cln.py --csv
 ```
 
+Write SARIF for CI/CD or code scanning:
+
+```powershell
+python .\cln.py --sarif .\reports\cln.sarif
+```
+
+Only show findings that were not present in a previous JSON report:
+
+```powershell
+python .\cln.py --json > .\reports\baseline.json
+python .\cln.py --baseline .\reports\baseline.json
+```
+
 Every scan saves a readable text report:
 
 ```text
@@ -92,6 +111,31 @@ Cleanup acts on built-in confirmed known-bad hashes by default. To also quaranti
 python .\cln.py --known-bad .\hashes.json --clean --clean-user-hashes
 ```
 
+Structured hash lists are supported for provenance:
+
+```json
+{
+  "schema": "cln-hash-list-v1",
+  "description": "Internal confirmed bad hashes",
+  "updated_at": "2026-04-30T00:00:00Z",
+  "hashes": [
+    {"sha256": "7123e1514b939b165985560057fe3c761440a9fff9783a3b84e861fd2888d4ab", "description": "known bad sample"}
+  ]
+}
+```
+
+Add external content rules without editing `cln.py`:
+
+```powershell
+python .\cln.py --rules .\rules.json
+```
+
+Run YARA rules when `yara-python` is installed:
+
+```powershell
+python .\cln.py --yara-rules .\yara-rules
+```
+
 ## What It Checks
 
 - Suspicious executable and script files.
@@ -102,11 +146,12 @@ python .\cln.py --known-bad .\hashes.json --clean --clean-user-hashes
 - Scam-like names and script content.
 - Zip files, Office documents, Java/Android packages, and browser/package archives containing runnable files.
 - Basic visibility for unsupported `.7z`, `.rar`, `.cab`, `.iso`, and `.img` containers.
-- Archive path traversal, suspicious compression ratios, embedded macro projects, and external Office links.
+- Archive path traversal, suspicious compression ratios, nested ZIPs, embedded macro projects, and external Office links.
+- Basic PDF JavaScript/Launch indicators, legacy Office macro indicators, and suspicious shortcut targets.
 - Evidence snippets with byte offsets and line numbers for matched script-content rules.
 - Windows startup folders, registry Run entries, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
 - Compiled Python artifacts, raw IP indicators, and suspicious URL TLDs in scripts.
-- Known-bad hashes.
+- Known-bad hashes and trusted-hash allowlist visibility.
 
 ## Safety
 
