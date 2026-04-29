@@ -1,0 +1,7 @@
+# CLN runs on the Python standard library by default.
+#
+# Install optional integrations:
+#   python -m pip install -r requirements.txt
+#
+# Optional: enables --yara-rules malware signature scanning.
+yara-python>=4.5.0
