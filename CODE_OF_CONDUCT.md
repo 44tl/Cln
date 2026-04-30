@@ -46,8 +46,6 @@ You can use AI to help write code, but you must understand what the AI produces.
   - Windows internals, PE files, archives, scripts
   - Why certain patterns are suspicious
 
-AI can help with syntax and boilerplate, but it doesn't understand security context. The responsibility is yours.
-
 ## Reporting
 
 If you observe violations of this code of conduct, please report them by opening an issue.
