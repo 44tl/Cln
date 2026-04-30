@@ -59,6 +59,16 @@ BUILTIN_KNOWN_BAD_DETAILS = {
     "7123e1514b939b165985560057fe3c761440a9fff9783a3b84e861fd2888d4ab": "lnstaIer.exe known-bad sample",
 }
 
+BUILTIN_KNOWN_BAD_FILENAMES = {
+    "7123e1514b939b165985560057fe3c761440a9fff9783a3b84e861fd2888d4ab": {
+        "lnstailer.exe",
+        "lnstaier.exe",
+        "lnstaler.exe",
+        "lnstaiier.exe",
+        "lnstaier",
+    },
+}
+
 DANGEROUS_EXTENSIONS = {
     ".exe",
     ".dll",
@@ -272,7 +282,12 @@ class RuleSet:
         return iter(self.rules)
 
     def extend(self, rules: Iterable[ContentRule]) -> None:
-        self.rules.extend(rules)
+        existing = {rule.rule_id for rule in self.rules}
+        for rule in rules:
+            if rule.rule_id in existing:
+                continue
+            self.rules.append(rule)
+            existing.add(rule.rule_id)
 
 SUSPICIOUS_NAME_PATTERNS = [
     re.compile(r"(?i)\bmr\s*beast\b|\bmrbeast\b"),
@@ -310,6 +325,32 @@ CONTENT_RULES = RuleSet([
     ("startup-persistence", "Windows startup persistence command", "high", re.compile(rb"(?is)\\Software\\Microsoft\\Windows\\CurrentVersion\\Run(?:Once)?\\")),
 ])
 
+RULE_PACK_CHOICES = ("recommended", "downloads", "scripts", "documents", "full")
+RULE_PACK_DESCRIPTIONS = {
+    "recommended": "Recommended: balanced local rules for scams, scripts, documents, archives, and startup risk.",
+    "downloads": "Downloads: stronger scam, fake installer, archive, and renamed executable checks.",
+    "scripts": "Scripts: stronger PowerShell, batch, JavaScript, VBScript, and credential theft checks.",
+    "documents": "Documents: stronger Office, PDF, macro, and external-link checks.",
+    "full": "Full: all built-in rule packs with more review noise.",
+}
+
+SUSPICIOUS_NETWORK_PORTS = {1337, 4444, 5555, 6666, 8080, 8443, 31337}
+
+BUILTIN_RULE_PACK_RULES: dict[str, list[ContentRule]] = {
+    "downloads": [
+        ContentRule("pack-download-suspicious-installer", "Downloaded installer uses scam or lure language", "high", re.compile(rb"(?is)(?:setup|installer|update).{0,180}(?:free|gift|nitro|robux|wallet|verify|airdrop|crack|keygen)"), "Do not run the installer until the publisher and download source are verified."),
+        ContentRule("pack-download-password-archive", "Download references password-protected archive behavior", "medium", re.compile(rb"(?is)(?:password|passcode).{0,120}(?:zip|rar|7z|archive)|(?:zip|rar|7z|archive).{0,120}(?:password|passcode)"), "Password-protected archives often bypass attachment scanning; inspect contents carefully."),
+    ],
+    "scripts": [
+        ContentRule("pack-script-hidden-window", "Script launches a hidden process window", "high", re.compile(rb"(?is)(?:-windowstyle\s+hidden|wscript\.shell.{0,120}run.{0,120},\s*0\b|start-process.{0,180}-windowstyle\s+hidden)"), "Hidden script execution is high-risk unless expected from a trusted admin tool."),
+        ContentRule("pack-script-clipboard-or-token-access", "Script references clipboard or token data", "medium", re.compile(rb"(?is)(?:Get-Clipboard|navigator\.clipboard|clipboardData|discord.{0,80}token|authorization.{0,40}bearer)"), "Review whether the script collects credentials, tokens, or clipboard contents."),
+    ],
+    "documents": [
+        ContentRule("pack-doc-office-dde", "Office document content references DDE execution", "high", re.compile(rb"(?is)\bDDE(?:AUTO)?\b.{0,180}\b(?:cmd|powershell|mshta|rundll32|wscript)"), "Open only with macros and external content disabled, then inspect the document."),
+        ContentRule("pack-doc-pdf-submitform", "PDF references form submission behavior", "medium", re.compile(rb"(?is)/(?:SubmitForm|GoToE|RichMedia|AcroForm)\b"), "Review the PDF actions in a sandboxed viewer."),
+    ],
+}
+
 AUTHENTICODE_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
 REDACTION_LEVELS = {"full", "secrets", "none"}
 
@@ -341,6 +382,11 @@ class Finding:
     detail: str
     evidence: str | None = None
     remediation: str | None = None
+    confidence: str | None = None
+    signals: list[str] = field(default_factory=list)
+    false_positive_notes: str | None = None
+    next_action: str | None = None
+    related: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -436,11 +482,20 @@ class PEInfo:
     image_base: int = 0
     import_table_rva: int = 0
     import_table_size: int = 0
+    export_table_rva: int = 0
+    export_table_size: int = 0
+    resource_table_rva: int = 0
+    resource_table_size: int = 0
+    tls_table_rva: int = 0
+    tls_table_size: int = 0
+    debug_table_rva: int = 0
+    debug_table_size: int = 0
     sections: list[PESection] = field(default_factory=list)
     imports: list[tuple[str, str]] = field(default_factory=list)
 
 
-def finding_to_dict(finding: Finding, *, redact: bool | str = True) -> dict[str, str | None]:
+def finding_to_dict(finding: Finding, *, redact: bool | str = True) -> dict[str, object]:
+    finding = explain_finding(finding)
     return {
         "rule_id": output_text(finding.rule_id, redact=redact),
         "title": output_text(finding.title, redact=redact),
@@ -448,7 +503,78 @@ def finding_to_dict(finding: Finding, *, redact: bool | str = True) -> dict[str,
         "detail": output_text(finding.detail, redact=redact),
         "evidence": output_text(finding.evidence, redact=redact) if finding.evidence else None,
         "remediation": output_text(finding.remediation, redact=redact) if finding.remediation else None,
+        "confidence": output_text(finding.confidence, redact=redact) if finding.confidence else None,
+        "signals": [output_text(signal, redact=redact) for signal in finding.signals],
+        "false_positive_notes": output_text(finding.false_positive_notes, redact=redact) if finding.false_positive_notes else None,
+        "next_action": output_text(finding.next_action, redact=redact) if finding.next_action else None,
+        "related": [output_text(item, redact=redact) for item in finding.related],
     }
+
+
+RULE_EXPLANATIONS: dict[str, dict[str, object]] = {
+    "known-bad-hash": {
+        "confidence": "high",
+        "signals": ["Exact SHA-256 hash match"],
+        "false_positive_notes": "False positives are unlikely for a confirmed hash, but verify the hash source.",
+        "next_action": "Quarantine or delete after confirming the file path and hash.",
+    },
+    "ps-encoded-command": {
+        "confidence": "high",
+        "signals": ["PowerShell command line contains -EncodedCommand"],
+        "false_positive_notes": "Some administration tools encode commands, but downloaded scripts should be treated carefully.",
+        "next_action": "Decode the payload and review network, persistence, and execution behavior.",
+    },
+    "decoded-ps-download-exec": {
+        "confidence": "high",
+        "signals": ["Decoded PowerShell payload downloads and executes content"],
+        "next_action": "Treat as suspicious until the URL and payload are verified.",
+        "related": ["ps-encoded-command", "ps-download-exec"],
+    },
+    "shortcut-suspicious-target": {
+        "confidence": "high",
+        "signals": ["Parsed LNK command launches a script interpreter or LOLBin"],
+        "false_positive_notes": "Enterprise shortcuts can wrap command interpreters, but consumer downloads rarely should.",
+        "next_action": "Inspect the parsed target, arguments, working directory, and icon path before opening.",
+    },
+    "pdf-open-action": {
+        "confidence": "medium",
+        "signals": ["PDF object graph contains /OpenAction"],
+        "false_positive_notes": "Some benign PDFs use open actions for navigation.",
+        "next_action": "Open only in a sandboxed viewer and inspect actions before trusting.",
+    },
+    "pe-injection-imports": {
+        "confidence": "medium",
+        "signals": ["PE imports a process injection API cluster"],
+        "false_positive_notes": "Debuggers, security tools, and installers can import these APIs legitimately.",
+        "next_action": "Combine with signature, location, entropy, and timestamp signals before cleanup.",
+    },
+}
+
+
+def explain_finding(finding: Finding) -> Finding:
+    if finding.confidence and finding.signals and finding.next_action:
+        return finding
+    explanation = RULE_EXPLANATIONS.get(finding.rule_id)
+    if not explanation:
+        base_confidence = "high" if finding.severity in {"critical", "high"} else "medium" if finding.severity == "medium" else "low"
+        if finding.confidence is None:
+            finding.confidence = base_confidence
+        if not finding.signals:
+            finding.signals = [finding.title]
+        if finding.next_action is None:
+            finding.next_action = finding.remediation or "Review the evidence and verify the file source."
+        return finding
+    if finding.confidence is None:
+        finding.confidence = str(explanation.get("confidence") or "medium")
+    if not finding.signals:
+        finding.signals = [str(item) for item in explanation.get("signals", [])]
+    if finding.false_positive_notes is None and explanation.get("false_positive_notes"):
+        finding.false_positive_notes = str(explanation["false_positive_notes"])
+    if finding.next_action is None and explanation.get("next_action"):
+        finding.next_action = str(explanation["next_action"])
+    if not finding.related and explanation.get("related"):
+        finding.related = [str(item) for item in explanation.get("related", [])]
+    return finding
 
 
 def output_text(value: object, *, redact: bool | str = True, limit: int | None = None) -> str:
@@ -618,6 +744,16 @@ class Scanner:
 
             if self.check_signatures and (suffix in SIGNED_APP_EXTENSIONS or result.file_type == "windows-pe"):
                 self.scan_signature(path, result)
+            if suffix == ".lnk" or result.file_type == "windows-shortcut":
+                result.findings.extend(scan_lnk(path, sample))
+            if suffix == ".pdf" or result.file_type == "pdf-document":
+                result.findings.extend(scan_pdf(path, sample))
+            if result.file_type in {"windows-pe", "mz-executable"}:
+                result.findings.extend(scan_pe(path, sample))
+            if result.file_type == "compound-document" or suffix in {".doc", ".xls", ".ppt", ".msi"}:
+                result.findings.extend(scan_ole_vba(path, sample))
+            if suffix in {".ps1", ".psm1"} or (result.file_type == "script-text" and b"powershell" in sample[:200].lower()):
+                result.findings.extend(scan_powershell_ast(path, sample))
             self.apply_compound_rules(result)
         except Exception as exc:  # noqa: BLE001 - scanner should keep going.
             result.error = f"{type(exc).__name__}: {exc}"
@@ -771,14 +907,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("paths", nargs="*", type=Path, help="Files or folders to scan. Defaults to Downloads, Desktop, Documents, and temp.")
     parser.add_argument("--full", action="store_true", help="Scan the whole user profile.")
+    parser.add_argument("--profile", choices=("fast", "deep", "forensic", "paranoid"), default="fast", help="Preset scan profile. Explicit flags still override the preset. Default: fast.")
     parser.add_argument("--startup", action="store_true", help="Inspect Windows startup folders and registry Run keys.")
     parser.add_argument("--processes", action="store_true", help="Inspect running process command lines and executable memory regions on Windows.")
+    parser.add_argument("--network", action="store_true", help="Map active local network connections to processes on Windows without external lookups.")
+    parser.add_argument("--continuous", action="store_true", help="Run a bounded polling scan loop instead of a single scan.")
+    parser.add_argument("--poll-interval", type=positive_int, default=30, help="Seconds between --continuous polling rounds. Default: 30.")
+    parser.add_argument("--poll-count", type=positive_int, default=3, help="Number of --continuous polling rounds. Default: 3.")
+    parser.add_argument("--gui", action="store_true", help="Open the built-in review and removal GUI after scanning.")
+    parser.add_argument("--cli", action="store_true", help="Run the command-line scanner instead of the default GUI launcher.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--csv", action="store_true", help="Print findings as CSV.")
     parser.add_argument("--sarif", type=Path, help="Write a SARIF 2.1.0 report for code-scanning or CI ingestion.")
+    parser.add_argument("--timeline", action="store_true", help="Include a chronological timeline in JSON and text reports.")
+    parser.add_argument("--bundle", type=Path, help="Export a local evidence bundle folder with reports, metadata, hashes, and selected samples.")
     parser.add_argument("--baseline", type=Path, help="Compare against a previous CLN JSON report and only keep new matching findings.")
+    parser.add_argument("--rule-pack", choices=RULE_PACK_CHOICES, default="recommended", help="Built-in rule pack for non-technical scanning. Default: recommended.")
     parser.add_argument("--rules", type=Path, help="Load extra content rules from a structured JSON rule file.")
     parser.add_argument("--yara-rules", type=Path, help="Run optional yara-python rules from this file or directory when yara-python is installed.")
+    parser.add_argument("--yara-lite-rules", type=Path, help="Run CLN's built-in YARA-lite JSON rule engine.")
     parser.add_argument("--max-mb", type=positive_int, default=75, help="Content scan size limit in MB. Metadata and magic bytes are still inspected for larger files. Default: 75.")
     parser.add_argument("--workers", type=worker_count, default=None, help="Parallel worker count from 1 to 64. Default: auto.")
     parser.add_argument("--known-bad", type=Path, help="JSON array of known bad SHA-256 hashes.")
@@ -796,6 +943,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clean-user-hashes", action="store_true", help="With --clean, also quarantine hashes supplied through --known-bad.")
     parser.add_argument("--delete", action="store_true", help="With --clean, permanently delete built-in confirmed known-bad files instead of quarantining.")
     parser.add_argument("--quarantine-dir", type=Path, default=Path("quarantine"), help="Where --clean stores removed files. Default: .\\quarantine")
+    parser.add_argument("--restore", type=Path, help="Restore a quarantined file using a CLN quarantine manifest.")
     parser.add_argument("--report-dir", type=Path, default=Path("reports"), help="Where readable text reports are saved. Default: .\\reports")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
@@ -806,13 +954,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.json and args.csv:
         parser.error("--json and --csv cannot be used together")
+    if should_launch_default_gui(args, argv):
+        launch_settings_gui(args)
+        return 0
+    apply_profile_defaults(args)
     global COLOR_ENABLED
-    if args.no_color or args.json or args.csv:
+    if args.no_color or args.json or args.csv or args.gui:
         COLOR_ENABLED = False
     redact_outputs = "none" if args.no_redact else args.redact_level
+    if args.restore:
+        report = restore_quarantine_manifest(args.restore)
+        if args.json:
+            print(json.dumps({"restore": [output_text(line, redact=redact_outputs) for line in report]}, indent=2))
+        else:
+            for line in report:
+                print(output_text(line, redact=redact_outputs))
+        return 0 if report and report[0].startswith("Restored") else 1
     paths = choose_paths(args)
-    verbose = not args.quiet and not args.json and not args.csv
+    verbose = not args.quiet and not args.json and not args.csv and not args.gui
     user_known_bad = load_hashes(args.known_bad)
+    CONTENT_RULES.extend(load_builtin_rule_pack(args.rule_pack))
     if args.rules:
         CONTENT_RULES.extend(load_content_rules(args.rules))
     cleanable_hashes = BUILTIN_KNOWN_BAD_SHA256 | (user_known_bad if args.clean_user_hashes else set())
@@ -832,9 +993,11 @@ def main(argv: list[str] | None = None) -> int:
         recent_days=args.recent_days,
         archive_depth=args.archive_depth,
     )
-    summary = scanner.scan_paths(paths)
+    summary = run_continuous_scan(scanner, paths, args.poll_interval, args.poll_count, verbose=verbose) if args.continuous else scanner.scan_paths(paths)
     if args.yara_rules:
         apply_yara_rules(summary, args.yara_rules)
+    if args.yara_lite_rules:
+        apply_yara_lite_rules(summary, args.yara_lite_rules)
     if args.startup:
         if verbose:
             say("Startup", "Checking folders, registry persistence, tasks, WMI, and browser extensions", "cyan")
@@ -846,6 +1009,11 @@ def main(argv: list[str] | None = None) -> int:
             say("Processes", "Checking command lines and executable private memory regions", "cyan")
         summary.results.extend(scan_running_processes())
         summary.results.sort(key=lambda item: (-item.score, item.path.lower()))
+    if args.network:
+        if verbose:
+            say("Network", "Mapping active local connections to processes without reputation lookups", "cyan")
+        summary.results.extend(scan_network_connections())
+        summary.results.sort(key=lambda item: (-item.score, item.path.lower()))
 
     cleanup_report: list[str] = []
     if args.clean:
@@ -853,6 +1021,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.baseline:
         summary = filter_baseline(summary, args.baseline, redact=redact_outputs)
+
+    if args.gui:
+        launch_removal_gui(summary, paths, args.quarantine_dir, cleanable_hashes, redact=redact_outputs)
+        return 0
 
     report_path: Path | None = None
     report_error: str | None = None
@@ -870,6 +1042,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         data = summary.to_dict(redact=redact_outputs)
+        if args.timeline:
+            data["timeline"] = timeline_to_dict(build_timeline(summary), redact=redact_outputs)
         data["redacted"] = redact_outputs != "none"
         data["redaction_level"] = redact_outputs
         data["cleanup"] = [output_text(line, redact=redact_outputs) for line in cleanup_report]
@@ -898,7 +1072,535 @@ def main(argv: list[str] | None = None) -> int:
             print(color(f"Scan complete. Review: {output_text(report_path, redact=redact_outputs)}", "green"))
         else:
             print(color("Scan complete. Text report was not saved.", "green"))
+    if args.bundle:
+        try:
+            bundle_path = export_evidence_bundle(args.bundle, summary, paths, cleanup_report, redact=redact_outputs)
+            if not args.json and not args.csv:
+                print(color(f"Evidence bundle: {output_text(bundle_path, redact=redact_outputs)}", "green"))
+        except Exception as exc:  # noqa: BLE001
+            if not args.json and not args.csv:
+                print(color(f"Bundle warning: {type(exc).__name__}: {output_text(exc, redact=redact_outputs)}", "yellow"))
     return 2 if any(result.verdict in {"dangerous", "suspicious"} for result in summary.results) else 0
+
+
+def should_launch_default_gui(args: argparse.Namespace, argv: list[str] | None) -> bool:
+    raw_args = sys.argv[1:] if argv is None else argv
+    if args.cli or args.gui or args.json or args.csv or args.sarif or args.clean or args.restore:
+        return False
+    return len(raw_args) == 0
+
+
+def powershell_quote(value: object) -> str:
+    text = str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+def launch_cli_powershell(extra_args: list[str] | None = None) -> None:
+    script = Path(__file__).resolve()
+    python_exe = Path(sys.executable).resolve()
+    args = ["--cli"] + (extra_args or [])
+    command = " ".join([powershell_quote(python_exe), powershell_quote(script), *[powershell_quote(item) for item in args]])
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or "powershell.exe"
+    subprocess.Popen([powershell, "-NoExit", "-Command", f"& {command}"], close_fds=True)  # noqa: S603 - explicit user action.
+
+
+def launch_settings_gui(args: argparse.Namespace) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not open GUI: {type(exc).__name__}: {exc}")
+        print("Run `python cln.py --cli` for the command-line scanner.")
+        return
+
+    root = tk.Tk()
+    root.title("CLN Scanner")
+    root.geometry("980x760")
+
+    container = ttk.Frame(root, padding=10)
+    container.pack(fill="both", expand=True)
+    canvas = tk.Canvas(container, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+    form = ttk.Frame(canvas)
+    form.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+    form_window = canvas.create_window((0, 0), window=form, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    def sync_form_width(event: object) -> None:
+        width = getattr(event, "width", 0)
+        if width:
+            canvas.itemconfigure(form_window, width=width)
+
+    def scroll_settings(event: object) -> str:
+        delta = getattr(event, "delta", 0)
+        number = getattr(event, "num", None)
+        if delta:
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        elif number == 4:
+            canvas.yview_scroll(-3, "units")
+        elif number == 5:
+            canvas.yview_scroll(3, "units")
+        return "break"
+
+    def bind_settings_scroll(_: object | None = None) -> None:
+        canvas.bind_all("<MouseWheel>", scroll_settings)
+        canvas.bind_all("<Button-4>", scroll_settings)
+        canvas.bind_all("<Button-5>", scroll_settings)
+
+    def unbind_settings_scroll(_: object | None = None) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Configure>", sync_form_width)
+    canvas.bind("<Enter>", bind_settings_scroll)
+    canvas.bind("<Leave>", unbind_settings_scroll)
+
+    status_var = tk.StringVar(value="Ready")
+    row = 0
+
+    def label(text: str) -> None:
+        nonlocal row
+        ttk.Label(form, text=text).grid(row=row, column=0, columnspan=4, sticky="w", pady=(12, 4))
+        row += 1
+
+    def add_entry(name: str, default: str = "", width: int = 58) -> tk.StringVar:
+        nonlocal row
+        var = tk.StringVar(value=default)
+        ttk.Label(form, text=name).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Entry(form, textvariable=var, width=width).grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
+        row += 1
+        return var
+
+    def add_path(name: str, default: str = "", *, directory: bool = False) -> tk.StringVar:
+        nonlocal row
+        var = tk.StringVar(value=default)
+        ttk.Label(form, text=name).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Entry(form, textvariable=var, width=58).grid(row=row, column=1, sticky="ew", pady=2)
+        def browse() -> None:
+            selected = filedialog.askdirectory() if directory else filedialog.askopenfilename()
+            if selected:
+                var.set(selected)
+        ttk.Button(form, text="Browse", command=browse).grid(row=row, column=2, sticky="w", padx=(6, 0), pady=2)
+        row += 1
+        return var
+
+    def add_bool(name: str, default: bool = False, tooltip: str = "") -> tk.BooleanVar:
+        nonlocal row
+        var = tk.BooleanVar(value=default)
+        frame = ttk.Frame(form)
+        frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text=name, variable=var).pack(side="left")
+        if tooltip:
+            info_btn = ttk.Label(frame, text="ⓘ", font=("Segoe UI", 9), foreground="#0066cc", cursor="question_arrow")
+            info_btn.pack(side="left", padx=(4, 0))
+            tooltip_window = None
+
+            def show_tooltip(event: object | None = None) -> None:
+                nonlocal tooltip_window
+                if tooltip_window or not tooltip:
+                    return
+                tooltip_window = tk.Toplevel(root)
+                tooltip_window.overrideredirect(True)
+                tooltip_window.configure(background="#ffffd0")
+                x = info_btn.winfo_rootx()
+                y = info_btn.winfo_rooty() + info_btn.winfo_height()
+                tooltip_window.geometry(f"+{x}+{y}")
+                label = tk.Label(
+                    tooltip_window,
+                    text=tooltip,
+                    font=("Segoe UI", 8),
+                    background="#ffffd0",
+                    foreground="#000000",
+                    relief="solid",
+                    borderwidth=1,
+                    wraplength=320,
+                    justify="left",
+                    padx=6,
+                    pady=4,
+                )
+                label.pack()
+
+            def hide_tooltip(event: object | None = None) -> None:
+                nonlocal tooltip_window
+                if tooltip_window:
+                    tooltip_window.destroy()
+                    tooltip_window = None
+
+            info_btn.bind("<Enter>", show_tooltip)
+            info_btn.bind("<Leave>", hide_tooltip)
+        row += 1
+        return var
+
+    label("Targets")
+    paths_var = add_entry("Paths", "")
+    target_buttons = ttk.Frame(form)
+    target_buttons.grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 6))
+
+    def current_targets() -> list[str]:
+        return [item.strip() for item in paths_var.get().split(";") if item.strip()]
+
+    def set_targets(values: Iterable[object]) -> None:
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if not text or text.lower() in seen:
+                continue
+            seen.add(text.lower())
+            cleaned.append(text)
+        paths_var.set("; ".join(cleaned))
+
+    def append_targets(values: Iterable[object]) -> None:
+        set_targets([*current_targets(), *values])
+
+    def add_files() -> None:
+        selected = filedialog.askopenfilenames(title="Select files to scan")
+        if selected:
+            append_targets(selected)
+
+    def add_folder() -> None:
+        selected = filedialog.askdirectory(title="Select folder to scan")
+        if selected:
+            append_targets([selected])
+
+    def add_common_locations() -> None:
+        append_targets(default_quick_paths())
+
+    def choose_drives(*, removable_only: bool) -> None:
+        drives = available_scan_drives(removable_only=removable_only)
+        if not drives:
+            messagebox.showinfo("CLN Scanner", "No matching drives were found.")
+            return
+        dialog = tk.Toplevel(root)
+        dialog.title("Select drives to scan")
+        dialog.transient(root)
+        dialog.grab_set()
+        vars_by_drive: list[tuple[Path, tk.BooleanVar]] = []
+        ttk.Label(dialog, text="Select drives to add as scan targets.", padding=10).pack(anchor="w")
+        body = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        body.pack(fill="both", expand=True)
+        for drive in drives:
+            var = tk.BooleanVar(value=True)
+            vars_by_drive.append((drive, var))
+            ttk.Checkbutton(body, text=str(drive), variable=var).pack(anchor="w", pady=2)
+        buttons_frame = ttk.Frame(dialog, padding=10)
+        buttons_frame.pack(fill="x")
+
+        def add_selected_drives() -> None:
+            append_targets([drive for drive, var in vars_by_drive if var.get()])
+            dialog.destroy()
+
+        ttk.Button(buttons_frame, text="Add Selected", command=add_selected_drives).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons_frame, text="Cancel", command=dialog.destroy).pack(side="right")
+
+    ttk.Button(target_buttons, text="Add Files", command=add_files).pack(side="left", padx=(0, 6))
+    ttk.Button(target_buttons, text="Add Folder", command=add_folder).pack(side="left", padx=(0, 6))
+    ttk.Button(target_buttons, text="Add Drive", command=lambda: choose_drives(removable_only=False)).pack(side="left", padx=(0, 6))
+    ttk.Button(target_buttons, text="Add USB", command=lambda: choose_drives(removable_only=True)).pack(side="left", padx=(0, 6))
+    ttk.Button(target_buttons, text="Common Locations", command=add_common_locations).pack(side="left", padx=(0, 6))
+    ttk.Button(target_buttons, text="Clear", command=lambda: paths_var.set("")).pack(side="left")
+    row += 1
+    full_var = add_bool("Scan whole user profile (--full)", bool(args.full), "Scan everything in your user profile folder (~). Covers Downloads, Desktop, Documents, AppData, and all subfolders.")
+    profile_var = tk.StringVar(value=args.profile)
+    ttk.Label(form, text="Profile").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+    ttk.Combobox(form, textvariable=profile_var, values=("fast", "deep", "forensic", "paranoid"), state="readonly", width=18).grid(row=row, column=1, sticky="w", pady=2)
+    row += 1
+    rule_pack_var = tk.StringVar(value=args.rule_pack)
+    ttk.Label(form, text="Premade rules").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+    rule_pack_box = ttk.Combobox(form, textvariable=rule_pack_var, values=RULE_PACK_CHOICES, state="readonly", width=18)
+    rule_pack_box.grid(row=row, column=1, sticky="w", pady=2)
+    rule_pack_help = tk.StringVar(value=RULE_PACK_DESCRIPTIONS[args.rule_pack])
+    ttk.Label(form, textvariable=rule_pack_help, wraplength=520).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=2)
+    row += 1
+
+    def update_rule_pack_help(*_: object) -> None:
+        rule_pack_help.set(RULE_PACK_DESCRIPTIONS.get(rule_pack_var.get(), "Built-in rule pack."))
+
+    rule_pack_box.bind("<<ComboboxSelected>>", update_rule_pack_help)
+
+    label("Scan Coverage")
+    startup_var = add_bool("Startup checks (--startup)", bool(args.startup), "Check Windows startup folders, registry Run/RunOnce, COM overrides, IFEO debugger keys, AppInit DLLs, Scheduled Tasks, WMI subscriptions, and risky browser extensions.")
+    processes_var = add_bool("Process checks (--processes)", bool(args.processes), "Check running process command lines for living-off-the-land tools (powershell, cmd, regsvr32, rundll32, mshta, etc.) and scan process memory for executable private regions like RWX pages.")
+    network_var = add_bool("Network-local telemetry (--network)", bool(args.network), "Map active local network connections to processes and show which executable handles each connection.")
+    signatures_var = add_bool("Authenticode signature checks (--signatures)", bool(args.signatures), "Verify Windows executable signatures. Checks if files are signed by trusted publishers and displays certificate chain.")
+    source_var = add_bool("Include source-code files (--include-source)", bool(args.include_source), "Also scan script files outside typical risky locations (not just Downloads, Desktop, Documents, temp).")
+    no_archives_var = add_bool("Do not inspect archives (--no-archives)", bool(args.no_archives), "Skip scanning inside ZIP, Office, Jar, and other archive files. Faster but may miss threats packed inside archives.")
+    timeline_var = add_bool("Include timeline (--timeline)", bool(args.timeline), "Add timestamp-based timeline of file changes to JSON output. Useful for incident response and tracing activity.")
+
+    label("Limits")
+    max_mb_var = add_entry("Max MB", str(args.max_mb), width=12)
+    workers_var = add_entry("Workers", "" if args.workers is None else str(args.workers), width=12)
+    archive_depth_var = add_entry("Archive depth", str(args.archive_depth), width=12)
+    recent_days_var = add_entry("Recent days", str(args.recent_days), width=12)
+    continuous_var = add_bool("Continuous polling (--continuous)", bool(args.continuous), "Run multiple scans at intervals to catch files that appear briefly or change over time.")
+    poll_interval_var = add_entry("Poll interval", str(args.poll_interval), width=12)
+    poll_count_var = add_entry("Poll count", str(args.poll_count), width=12)
+
+    label("Rules And Hashes")
+    known_bad_var = add_path("Known bad JSON", str(args.known_bad or ""))
+    known_good_var = add_path("Known good JSON", str(args.known_good or ""))
+    rules_var = add_path("Content rules JSON", str(args.rules or ""))
+    yara_var = add_path("YARA rules", str(args.yara_rules or ""))
+    yara_lite_var = add_path("YARA-lite rules", str(args.yara_lite_rules or ""))
+    baseline_var = add_path("Baseline JSON", str(args.baseline or ""))
+
+    label("Output")
+    report_dir_var = add_path("Report directory", str(args.report_dir), directory=True)
+    quarantine_dir_var = add_path("Quarantine directory", str(args.quarantine_dir), directory=True)
+    bundle_var = add_path("Evidence bundle directory", str(args.bundle or ""), directory=True)
+    sarif_var = add_path("SARIF path", str(args.sarif or ""))
+    redact_var = tk.StringVar(value=args.redact_level)
+    ttk.Label(form, text="Redaction").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+    ttk.Combobox(form, textvariable=redact_var, values=tuple(sorted(REDACTION_LEVELS)), state="readonly", width=18).grid(row=row, column=1, sticky="w", pady=2)
+    row += 1
+    no_redact_var = add_bool("No redaction (--no-redact)", bool(args.no_redact), "Disable redaction.Shows raw paths and tokens. Use for forensics where evidence must be preserved exactly as found.")
+    quiet_var = add_bool("Quiet CLI output (--quiet)", bool(args.quiet), "Suppress terminal progress output. Use when you only need JSON/CSV results or redirect output.")
+    no_color_var = add_bool("No CLI color (--no-color)", bool(args.no_color), "Disable colored terminal output. Useful when redirecting to files or using non-UTF8 terminals.")
+    json_var = add_bool("JSON CLI output (--json)", bool(args.json), "Output results as JSON for tool integration or automation.")
+    csv_var = add_bool("CSV CLI output (--csv)", bool(args.csv), "Output results as CSV for spreadsheet review.")
+
+    label("Cleanup")
+    clean_var = add_bool("Clean known-bad files (--clean)", bool(args.clean), "Quarantine files matching built-in known-bad SHA-256 hashes. Requires hash verification before removal.")
+    clean_user_var = add_bool("Clean user supplied known-bad hashes (--clean-user-hashes)", bool(args.clean_user_hashes), "Also quarantine files matching hashes from --known-bad. Off by default - must opt in.")
+    delete_var = add_bool("Permanent delete instead of quarantine (--delete)", bool(args.delete), "Permanently delete instead of moving to quarantine. Cannot be undone. Use with caution.")
+    restore_var = add_path("Restore manifest", str(args.restore or ""))
+
+    def build_args(*, for_gui: bool) -> list[str]:
+        built: list[str] = ["--cli"] if not for_gui else ["--gui"]
+        for item in paths_var.get().split(";"):
+            item = item.strip()
+            if item:
+                built.append(item)
+        bools = [
+            (full_var, "--full"),
+            (startup_var, "--startup"),
+            (processes_var, "--processes"),
+            (network_var, "--network"),
+            (continuous_var, "--continuous"),
+            (timeline_var, "--timeline"),
+            (no_archives_var, "--no-archives"),
+            (signatures_var, "--signatures"),
+            (source_var, "--include-source"),
+            (quiet_var, "--quiet"),
+            (no_color_var, "--no-color"),
+            (no_redact_var, "--no-redact"),
+            (clean_var, "--clean"),
+            (clean_user_var, "--clean-user-hashes"),
+            (delete_var, "--delete"),
+        ]
+        for var, flag in bools:
+            if var.get():
+                built.append(flag)
+        for flag, var in (
+            ("--profile", profile_var),
+            ("--rule-pack", rule_pack_var),
+            ("--max-mb", max_mb_var),
+            ("--archive-depth", archive_depth_var),
+            ("--recent-days", recent_days_var),
+            ("--poll-interval", poll_interval_var),
+            ("--poll-count", poll_count_var),
+            ("--redact-level", redact_var),
+        ):
+            value = var.get().strip()
+            if value:
+                built.extend([flag, value])
+        if workers_var.get().strip():
+            built.extend(["--workers", workers_var.get().strip()])
+        for flag, var in (
+            ("--known-bad", known_bad_var),
+            ("--known-good", known_good_var),
+            ("--rules", rules_var),
+            ("--yara-rules", yara_var),
+            ("--yara-lite-rules", yara_lite_var),
+            ("--baseline", baseline_var),
+            ("--report-dir", report_dir_var),
+            ("--quarantine-dir", quarantine_dir_var),
+            ("--bundle", bundle_var),
+            ("--sarif", sarif_var),
+        ):
+            value = var.get().strip()
+            if value:
+                built.extend([flag, value])
+        if restore_var.get().strip():
+            built.extend(["--restore", restore_var.get().strip()])
+        if not for_gui:
+            if json_var.get():
+                built.append("--json")
+            if csv_var.get():
+                built.append("--csv")
+        return built
+
+    def run_gui_scan() -> None:
+        if json_var.get() or csv_var.get():
+            messagebox.showinfo("CLN Scanner", "JSON and CSV are CLI output modes. The GUI scan will ignore those two output toggles.")
+        root.destroy()
+        main(build_args(for_gui=True))
+
+    def close_and_launch_cli() -> None:
+        if not messagebox.askyesno("Close and launch as CLI?", "This will close the GUI and launch a powershell CLI version of the tool, are you sure?"):
+            return
+        cli_args = build_args(for_gui=False)
+        root.destroy()
+        launch_cli_powershell(cli_args[1:] if cli_args and cli_args[0] == "--cli" else cli_args)
+
+    def show_information() -> None:
+        info = tk.Toplevel(root)
+        info.title("CLN Scanner Information")
+        info.geometry("760x640")
+        info.transient(root)
+        frame = ttk.Frame(info, padding=10)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, wrap="word", height=24)
+        info_scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=info_scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        info_scroll.pack(side="right", fill="y")
+        text.insert("end", settings_gui_information_text())
+        text.configure(state="disabled")
+        buttons_frame = ttk.Frame(info, padding=(10, 0, 10, 10))
+        buttons_frame.pack(fill="x")
+        ttk.Button(buttons_frame, text="Close", command=info.destroy).pack(side="right")
+
+    action_bar = ttk.Frame(root, padding=(10, 8))
+    action_bar.pack(fill="x")
+    ttk.Label(action_bar, textvariable=status_var).pack(side="left")
+    ttk.Button(action_bar, text="Run Scan", command=run_gui_scan).pack(side="right", padx=(8, 0))
+    ttk.Button(action_bar, text="Close and launch as CLI?", command=close_and_launch_cli).pack(side="right", padx=(8, 0))
+    ttk.Button(action_bar, text="Close", command=root.destroy).pack(side="right")
+    root.mainloop()
+
+
+def settings_gui_information_text() -> str:
+    return (
+        "CLN Scanner information\n"
+        "\n"
+        "What this tool does\n"
+        "CLN looks for warning signs in files, shortcuts, scripts, archives, documents, startup items, processes, and optional local network connections. It works locally and does not send files or hashes to a cloud service by default.\n"
+        "\n"
+        "Before you scan\n"
+        "Choose what you want to inspect. Common Locations checks places where suspicious downloads often land, such as Downloads, Desktop, Documents, and temp folders. Add Files checks specific files. Add Folder checks everything inside a folder. Add Drive scans a whole drive. Add USB lists removable drives when Windows reports them.\n"
+        "\n"
+        "Premade rules\n"
+        "Recommended is the best starting point for most people. Downloads focuses on scam installers, fake archives, and suspicious downloaded files. Scripts focuses on PowerShell, batch, JavaScript, VBScript, and token or credential access. Documents focuses on PDFs and Office macro-style behavior. Full enables all built-in packs and may show more items to review.\n"
+        "\n"
+        "Profiles\n"
+        "Fast is the quickest scan. Deep checks more content and signatures. Forensic also checks startup, running processes, local network connections, and timeline output. Paranoid uses higher limits and may be slower or noisier.\n"
+        "\n"
+        "Scan coverage options\n"
+        "Startup checks look for things that run automatically when Windows starts or when you sign in. Process checks inspect running process command lines and memory warning signs. Network-local telemetry maps active connections to processes without reputation lookups. Signature checks ask Windows whether executable files are signed by a trusted publisher. Include source-code files scans programming scripts outside the usual risky locations.\n"
+        "\n"
+        "Limits\n"
+        "Max MB controls how much file content CLN reads for deeper checks. Bigger values can find more but take longer. Archive depth controls how far nested ZIP-style archives are opened. Recent days controls what counts as a new runnable file. Continuous polling repeats scans a few times to catch files that appear briefly.\n"
+        "\n"
+        "Rules and hashes\n"
+        "Known bad hashes are exact SHA-256 file fingerprints you already trust as malicious. Known good hashes are exact file fingerprints you trust. Custom content rules, YARA rules, and YARA-lite rules are advanced options; most users can leave them empty and use Premade rules.\n"
+        "\n"
+        "Output and privacy\n"
+        "Reports are saved locally. Redaction hides common secrets and your home path in output. Evidence bundles copy selected high-risk samples and metadata into a local case folder. JSON, CSV, and SARIF are mainly for command-line or tool integration use.\n"
+        "\n"
+        "Cleanup and restore\n"
+        "Scanning does not delete anything by itself. Quarantine moves selected files into the quarantine folder and writes a manifest so they can be restored. Permanent delete is harder to undo and should only be used after you are sure. Restore manifest lets you put a quarantined file back if it was a false positive.\n"
+        "\n"
+        "Results\n"
+        "A finding means CLN saw a warning sign, not always confirmed malware. High and critical findings deserve attention first. Read the detail, evidence, confidence, and recommended action before quarantining anything.\n"
+        "\n"
+        "CLI button\n"
+        "Close and launch as CLI opens a PowerShell window with the same settings. Use it if you want terminal output, JSON or CSV, or easier copy-paste for support.\n"
+        "\n"
+        "Important safety note\n"
+        "CLN is not a full antivirus replacement and cannot guarantee a machine is clean. For serious infections, use Windows Defender Offline, change passwords from a clean device, and consider professional incident response if sensitive accounts, money, business systems, or private data may be involved.\n"
+    )
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> None:
+    if args.profile == "fast":
+        return
+    if args.profile in {"deep", "forensic", "paranoid"}:
+        args.signatures = True
+        args.include_source = True
+        args.archive_depth = max(args.archive_depth, 3)
+        args.max_mb = max(args.max_mb, 150)
+    if args.profile in {"forensic", "paranoid"}:
+        args.startup = True
+        args.processes = True
+        args.network = True
+        args.timeline = True
+        args.max_mb = max(args.max_mb, 300)
+    if args.profile == "paranoid":
+        args.archive_depth = max(args.archive_depth, 5)
+        args.recent_days = max(args.recent_days, 60)
+
+
+def run_continuous_scan(scanner: Scanner, paths: list[Path], interval: int, count: int, *, verbose: bool) -> ScanSummary:
+    combined: ScanSummary | None = None
+    seen: set[tuple[str, str, str | None]] = set()
+    for round_index in range(count):
+        if verbose:
+            say("Continuous", f"Polling round {round_index + 1}/{count}", "cyan")
+        current = scanner.scan_paths(paths)
+        if combined is None:
+            combined = current
+        else:
+            combined.scanned_files += current.scanned_files
+            combined.skipped_files += current.skipped_files
+            combined.denied_files += current.denied_files
+            combined.vanished_files += current.vanished_files
+            combined.elapsed_seconds += current.elapsed_seconds
+        for result in current.results:
+            key = (result.path, result.sha256 or "", result.error)
+            if key in seen:
+                continue
+            seen.add(key)
+            if combined is not current:
+                combined.results.append(result)
+        if round_index < count - 1:
+            time.sleep(interval)
+    if combined is None:
+        return ScanSummary(0, 0, [])
+    combined.results.sort(key=lambda item: (-item.score, item.path.lower()))
+    return combined
+
+
+def load_builtin_rule_pack(name: str) -> list[ContentRule]:
+    if name == "recommended":
+        selected = ("downloads", "scripts", "documents")
+    elif name == "full":
+        selected = tuple(BUILTIN_RULE_PACK_RULES)
+    else:
+        selected = (name,)
+    rules: list[ContentRule] = []
+    for pack in selected:
+        rules.extend(BUILTIN_RULE_PACK_RULES.get(pack, []))
+    return rules
+
+
+def available_scan_drives(*, removable_only: bool = False) -> list[Path]:
+    if platform.system() != "Windows":
+        roots = [Path("/") if Path("/").exists() else Path.cwd().anchor]
+        return [Path(root) for root in roots if str(root)]
+    try:
+        import ctypes
+    except ImportError:
+        return []
+    DRIVE_REMOVABLE = 2
+    DRIVE_FIXED = 3
+    DRIVE_REMOTE = 4
+    DRIVE_RAMDISK = 6
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    drives: list[Path] = []
+    for index in range(26):
+        if not bitmask & (1 << index):
+            continue
+        root = f"{chr(65 + index)}:\\"
+        drive_type = ctypes.windll.kernel32.GetDriveTypeW(root)
+        if removable_only and drive_type != DRIVE_REMOVABLE:
+            continue
+        if drive_type in {DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_REMOTE, DRIVE_RAMDISK}:
+            drives.append(Path(root))
+    return drives
 
 
 def choose_paths(args: argparse.Namespace) -> list[Path]:
@@ -1130,6 +1832,154 @@ def apply_yara_rules(summary: ScanSummary, rules_path: Path) -> None:
             )
 
 
+def apply_yara_lite_rules(summary: ScanSummary, rules_path: Path) -> None:
+    try:
+        rules = load_yara_lite_rules(rules_path)
+    except Exception as exc:  # noqa: BLE001
+        summary.results.append(
+            ScanResult(
+                path=str(rules_path),
+                kind="yara-lite",
+                findings=[Finding("yara-lite-load-error", "YARA-lite rules could not be loaded", "medium", f"{type(exc).__name__}: {exc}")],
+            )
+        )
+        return
+    for result in summary.results:
+        if result.kind != "file" or result.error:
+            continue
+        path = Path(result.path)
+        try:
+            size = path.stat().st_size
+            data = path.read_bytes() if size <= MAX_TEXT_SCAN_BYTES else path.read_bytes()[:MAX_TEXT_SCAN_BYTES]
+        except OSError as exc:
+            result.findings.append(Finding("yara-lite-scan-error", "YARA-lite scan failed for file", "low", f"{type(exc).__name__}: {exc}"))
+            continue
+        for rule in rules:
+            matched, detail = evaluate_yara_lite_rule(rule, data, size)
+            if matched:
+                result.findings.append(
+                    Finding(
+                        "yara-lite-match",
+                        f"YARA-lite match: {rule['id']}",
+                        str(rule.get("severity") or "high"),
+                        detail,
+                        remediation="Review the matching local rule and validate the file before taking action.",
+                    )
+                )
+
+
+def load_yara_lite_rules(path: Path) -> list[dict[str, object]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rules = data.get("rules") if isinstance(data, dict) else data
+    if not isinstance(rules, list):
+        raise ValueError("YARA-lite file must contain a rules array")
+    loaded: list[dict[str, object]] = []
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"rule #{index + 1} must be an object")
+        rule_id = str(rule.get("id") or rule.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rule_id):
+            raise ValueError(f"rule #{index + 1} has an invalid id")
+        strings = rule.get("strings") or {}
+        if not isinstance(strings, dict):
+            raise ValueError(f"rule {rule_id} strings must be an object")
+        parsed_strings: dict[str, tuple[str, bytes]] = {}
+        for name, value in strings.items():
+            token = str(name).lstrip("$")
+            if not re.fullmatch(r"[A-Za-z0-9_]{1,40}", token):
+                raise ValueError(f"rule {rule_id} has invalid string id {name}")
+            if isinstance(value, dict):
+                kind = str(value.get("type") or "text")
+                raw = str(value.get("value") or "")
+            else:
+                raw = str(value)
+                kind = "hex" if re.fullmatch(r"(?:[0-9A-Fa-f?]{2}\s*)+", raw) else "text"
+            if kind == "hex":
+                parsed = parse_yara_lite_hex(raw)
+            elif kind == "regex":
+                parsed = raw.encode("utf-8")
+            else:
+                parsed = raw.encode("utf-8")
+            parsed_strings[token] = (kind, parsed)
+        condition = str(rule.get("condition") or " or ".join(f"${name}" for name in parsed_strings))
+        severity = str(rule.get("severity") or "high").lower()
+        if severity not in SEVERITY_SCORE:
+            raise ValueError(f"rule {rule_id} has invalid severity {severity}")
+        loaded.append({"id": rule_id, "strings": parsed_strings, "condition": condition, "severity": severity})
+    return loaded
+
+
+def parse_yara_lite_hex(value: str) -> bytes:
+    normalized = re.sub(r"\s+", "", value)
+    if "?" in normalized:
+        normalized = normalized.replace("?", "0")
+    if len(normalized) % 2:
+        raise ValueError("hex pattern has an odd number of nibbles")
+    return bytes.fromhex(normalized)
+
+
+def evaluate_yara_lite_rule(rule: dict[str, object], data: bytes, file_size: int) -> tuple[bool, str]:
+    strings = rule.get("strings")
+    if not isinstance(strings, dict):
+        return False, ""
+    matches: dict[str, bool] = {}
+    details: list[str] = []
+    for name, item in strings.items():
+        if isinstance(item, tuple) and len(item) == 2:
+            kind, pattern = item
+        elif isinstance(item, dict):
+            kind = str(item.get("type") or "text")
+            raw_value = str(item.get("value") or "")
+            pattern = parse_yara_lite_hex(raw_value) if kind == "hex" else raw_value.encode("utf-8")
+        else:
+            raw_value = str(item)
+            kind = "hex" if re.fullmatch(r"(?:[0-9A-Fa-f?]{2}\s*)+", raw_value) else "text"
+            pattern = parse_yara_lite_hex(raw_value) if kind == "hex" else raw_value.encode("utf-8")
+        matched = False
+        if kind == "regex":
+            try:
+                matched = re.search(pattern.decode("utf-8", errors="replace").encode("utf-8"), data, flags=re.IGNORECASE | re.DOTALL) is not None
+            except re.error:
+                matched = False
+        elif kind == "text":
+            matched = bytes(pattern).lower() in data.lower()
+        else:
+            matched = bytes(pattern) in data
+        matches[str(name)] = matched
+        if matched:
+            details.append(f"${name}")
+    condition = str(rule.get("condition") or "")
+    expression = condition
+    expression = re.sub(r"\bfilesize\s*([<>]=?|==)\s*(\d+)\s*(KB|MB|B)?", lambda m: str(compare_filesize(file_size, m.group(1), int(m.group(2)), m.group(3) or "B")), expression, flags=re.IGNORECASE)
+    expression = re.sub(r"\bentropy\s*([<>]=?|==)\s*(\d+(?:\.\d+)?)", lambda m: str(compare_number(estimate_entropy_bytes(data), m.group(1), float(m.group(2)))), expression, flags=re.IGNORECASE)
+    for name, matched in sorted(matches.items(), key=lambda item: len(item[0]), reverse=True):
+        expression = re.sub(rf"\${re.escape(name)}\b", str(matched), expression)
+    if not re.fullmatch(r"[\sTrueFalsandorot()]+", expression):
+        return False, "unsupported condition"
+    try:
+        matched = bool(eval(expression, {"__builtins__": {}}, {}))  # noqa: S307 - expression is restricted above.
+    except Exception:
+        matched = False
+    return matched, f"condition={condition}; matched={', '.join(details) or 'condition only'}"
+
+
+def compare_filesize(actual: int, op: str, expected: int, unit: str) -> bool:
+    multiplier = {"B": 1, "KB": 1024, "MB": 1024 * 1024}[unit.upper()]
+    return compare_number(float(actual), op, float(expected * multiplier))
+
+
+def compare_number(actual: float, op: str, expected: float) -> bool:
+    if op == ">":
+        return actual > expected
+    if op == ">=":
+        return actual >= expected
+    if op == "<":
+        return actual < expected
+    if op == "<=":
+        return actual <= expected
+    return actual == expected
+
+
 def print_report(summary: ScanSummary, paths: list[Path], signatures_enabled: bool, *, redact: bool = True) -> None:
     print("")
     print(color(f"CLN Scanner {VERSION}", "bold"))
@@ -1260,6 +2110,16 @@ def write_text_report(
         lines.extend(["", "Cleanup"])
         lines.extend(f"  - {output_text(line, redact=redact)}" for line in cleanup_report)
 
+    timeline = build_timeline(summary)
+    if timeline:
+        lines.extend(["", "Timeline"])
+        for event in timeline[:500]:
+            lines.append(
+                f"  {output_text(event['time'], redact=redact)} | {output_text(event['kind'], redact=redact)} | "
+                f"{output_text(event['severity'], redact=redact)} | {output_text(event['path'], redact=redact)} | "
+                f"{output_text(event['summary'], redact=redact)}"
+            )
+
     lines.extend(
         [
             "",
@@ -1271,6 +2131,70 @@ def write_text_report(
     )
     secure_write_text_file(report_path, "\n".join(lines))
     return report_path
+
+
+def build_timeline(summary: ScanSummary) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    for result in summary.results:
+        when = result.modified or ""
+        if not when and result.kind in {"registry", "startup", "scheduled-task", "process", "network", "wmi-persistence", "browser-extension"}:
+            when = datetime.now().isoformat(timespec="seconds")
+        if not when:
+            continue
+        top = max((finding.severity for finding in result.findings), key=lambda item: SEVERITY_SCORE.get(item, 0), default="info")
+        summary_text = "; ".join(finding.rule_id for finding in result.findings[:3]) or result.error or result.verdict
+        events.append(
+            {
+                "time": when,
+                "kind": result.kind,
+                "severity": top,
+                "path": result.path,
+                "summary": summary_text,
+            }
+        )
+    return sorted(events, key=lambda item: (item["time"], item["path"].lower()))
+
+
+def timeline_to_dict(timeline: list[dict[str, str]], *, redact: bool | str = True) -> list[dict[str, str]]:
+    return [
+        {
+            "time": output_text(event["time"], redact=redact),
+            "kind": output_text(event["kind"], redact=redact),
+            "severity": output_text(event["severity"], redact=redact),
+            "path": output_text(event["path"], redact=redact),
+            "summary": output_text(event["summary"], redact=redact),
+        }
+        for event in timeline
+    ]
+
+
+def export_evidence_bundle(bundle_root: Path, summary: ScanSummary, paths: list[Path], cleanup_report: list[str], *, redact: bool | str = True) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    case_dir = bundle_root / f"cln-case-{timestamp}"
+    samples_dir = case_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=False)
+    secure_write_text_file(case_dir / "summary.json", json.dumps(summary.to_dict(redact=redact), indent=2))
+    secure_write_text_file(case_dir / "timeline.json", json.dumps(timeline_to_dict(build_timeline(summary), redact=redact), indent=2))
+    secure_write_text_file(case_dir / "cleanup.log", "\n".join(output_text(line, redact=redact) for line in cleanup_report))
+    secure_write_text_file(case_dir / "targets.txt", "\n".join(output_text(path, redact=redact) for path in paths))
+    copied: list[dict[str, object]] = []
+    for result in summary.results:
+        if result.kind != "file" or not result.findings or not result.sha256:
+            continue
+        if not any(finding.severity in {"critical", "high"} for finding in result.findings):
+            continue
+        source = Path(result.path)
+        try:
+            if not source.is_file() or source.stat().st_size > 50 * 1024 * 1024:
+                continue
+            sample_name = f"{result.sha256[:12]}_{re.sub(r'[^A-Za-z0-9._-]+', '_', source.name)}.sample"
+            destination = samples_dir / sample_name
+            shutil.copy2(source, destination)
+            copied.append({"source": output_text(source, redact=redact), "sample": output_text(destination, redact=redact), "sha256": result.sha256, "size": result.size})
+        except OSError as exc:
+            copied.append({"source": output_text(source, redact=redact), "error": f"{type(exc).__name__}: {output_text(exc, redact=redact)}"})
+    secure_write_text_file(case_dir / "samples-manifest.json", json.dumps(copied, indent=2))
+    return case_dir
 
 
 def collect_files(paths: Iterable[Path], max_bytes: int) -> tuple[list[Path], int]:
@@ -1567,6 +2491,26 @@ def analyze_pe_bytes(data: bytes, *, file_size: int, file_mtime: float | None) -
             findings.append(Finding("pe-injection-imports", "PE imports common process injection APIs", "high", f"imphash={imphash}, imports={', '.join(risky[:12])}"))
         elif len(risky) >= 4:
             findings.append(Finding("pe-risky-import-cluster", "PE imports multiple risky Windows APIs", "medium", f"imphash={imphash}, imports={', '.join(risky[:12])}"))
+    if info.export_table_rva and info.export_table_size:
+        findings.append(Finding("pe-exports-present", "PE exposes exports", "low", f"rva=0x{info.export_table_rva:x}, size={info.export_table_size}"))
+    if info.tls_table_rva and info.tls_table_size:
+        findings.append(Finding("pe-tls-directory", "PE has a TLS directory that may contain callbacks", "medium", f"rva=0x{info.tls_table_rva:x}, size={info.tls_table_size}"))
+    if info.resource_table_rva and info.resource_table_size:
+        offset = rva_to_offset(info.resource_table_rva, info.sections)
+        if offset is not None and offset < len(data):
+            resource_bytes = data[offset : min(len(data), offset + min(info.resource_table_size, 262_144))]
+            findings.append(Finding("pe-resource-hash", "PE resource table hash", "info", f"sha256={hashlib.sha256(resource_bytes).hexdigest()}, size={len(resource_bytes)}"))
+    overlay_offset = pe_overlay_offset(info)
+    if overlay_offset and file_size > overlay_offset:
+        overlay_size = file_size - overlay_offset
+        severity = "medium" if overlay_size >= 1024 * 1024 else "low"
+        findings.append(Finding("pe-overlay-data", "PE has appended overlay data", severity, f"offset={overlay_offset}, size={format_bytes(overlay_size)}"))
+    pdb_paths = sorted(set(match.decode("utf-8", errors="replace") for match in re.findall(rb"(?i)[A-Za-z]:\\[^<>\r\n]{3,180}\.pdb", data[:MAX_STRUCTURED_TEXT_BYTES])))
+    for pdb_path in pdb_paths[:3]:
+        findings.append(Finding("pe-pdb-path", "PE contains a PDB path", "low", pdb_path))
+    version_strings = extract_pe_version_strings(data)
+    if version_strings and version_metadata_mismatch(version_strings):
+        findings.append(Finding("pe-version-metadata-mismatch", "PE version metadata has inconsistent company/product names", "low", "; ".join(f"{key}={value}" for key, value in version_strings.items())[:400]))
     return findings
 
 
@@ -1592,8 +2536,19 @@ def parse_pe(data: bytes) -> PEInfo | None:
         info.entry_point_rva = int.from_bytes(data[optional_offset + 16 : optional_offset + 20], "little", signed=False)
     data_directory_offset = optional_offset + (96 if magic == 0x10B else 112)
     if data_directory_offset + 8 <= len(data):
+        info.export_table_rva = int.from_bytes(data[data_directory_offset : data_directory_offset + 4], "little", signed=False)
+        info.export_table_size = int.from_bytes(data[data_directory_offset + 4 : data_directory_offset + 8], "little", signed=False)
         info.import_table_rva = int.from_bytes(data[data_directory_offset + 8 : data_directory_offset + 12], "little", signed=False)
         info.import_table_size = int.from_bytes(data[data_directory_offset + 12 : data_directory_offset + 16], "little", signed=False)
+    if data_directory_offset + 24 <= len(data):
+        info.resource_table_rva = int.from_bytes(data[data_directory_offset + 16 : data_directory_offset + 20], "little", signed=False)
+        info.resource_table_size = int.from_bytes(data[data_directory_offset + 20 : data_directory_offset + 24], "little", signed=False)
+    if data_directory_offset + 56 <= len(data):
+        info.tls_table_rva = int.from_bytes(data[data_directory_offset + 72 : data_directory_offset + 76], "little", signed=False) if data_directory_offset + 80 <= len(data) else 0
+        info.tls_table_size = int.from_bytes(data[data_directory_offset + 76 : data_directory_offset + 80], "little", signed=False) if data_directory_offset + 80 <= len(data) else 0
+    if data_directory_offset + 56 <= len(data):
+        info.debug_table_rva = int.from_bytes(data[data_directory_offset + 48 : data_directory_offset + 52], "little", signed=False)
+        info.debug_table_size = int.from_bytes(data[data_directory_offset + 52 : data_directory_offset + 56], "little", signed=False)
     for index in range(section_count):
         offset = section_offset + (index * 40)
         if offset + 40 > len(data):
@@ -1605,6 +2560,35 @@ def parse_pe(data: bytes) -> PEInfo | None:
         info.sections.append(PESection(name, virtual_size, virtual_address, raw_size, raw_pointer, characteristics))
     info.imports = parse_pe_imports(data, info)
     return info
+
+
+def pe_overlay_offset(info: PEInfo) -> int:
+    offsets = [section.raw_pointer + section.raw_size for section in info.sections if section.raw_pointer and section.raw_size]
+    return max(offsets) if offsets else 0
+
+
+def extract_pe_version_strings(data: bytes) -> dict[str, str]:
+    text = data[:MAX_STRUCTURED_TEXT_BYTES].decode("utf-16-le", errors="ignore") + "\n" + data[:MAX_STRUCTURED_TEXT_BYTES].decode("latin-1", errors="ignore")
+    wanted = ("CompanyName", "FileDescription", "OriginalFilename", "ProductName", "InternalName")
+    values: dict[str, str] = {}
+    for key in wanted:
+        match = re.search(rf"(?is){re.escape(key)}\x00?\s*([\w .,\-(){{}}]{{2,120}})", text)
+        if match:
+            values[key] = re.sub(r"\s+", " ", match.group(1)).strip(" \0")
+    return values
+
+
+def version_metadata_mismatch(values: dict[str, str]) -> bool:
+    company = values.get("CompanyName", "").lower()
+    product = values.get("ProductName", "").lower()
+    original = values.get("OriginalFilename", "").lower()
+    if not values:
+        return False
+    microsoft_names = ("microsoft", "windows", "defender", "office")
+    claims_microsoft = any(token in company or token in product for token in microsoft_names)
+    odd_original = bool(original and not original.endswith((".exe", ".dll", ".sys", ".scr", ".ocx", ".cpl")))
+    generic_company = company in {"", "todo", "unknown", "company", "your company"}
+    return (claims_microsoft and original and not any(token in original for token in ("microsoft", "windows", "office", "defender", "ms"))) or odd_original or generic_company
 
 
 def rva_to_offset(rva: int, sections: list[PESection]) -> int | None:
@@ -1669,6 +2653,203 @@ def pe_imphash(imports: list[tuple[str, str]]) -> str:
         dll = dll_name.lower().rsplit(".", 1)[0]
         normalized.append(f"{dll}.{api_name.lower()}")
     return hashlib.md5(",".join(normalized).encode("utf-8")).hexdigest()
+
+
+def sorted_review_results(results: list[ScanResult]) -> list[ScanResult]:
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+    def key(result: ScanResult) -> tuple[int, int, str]:
+        severities = [finding.severity for finding in result.findings] or ["info"]
+        best = min(severity_rank.get(severity, 5) for severity in severities)
+        priority = 0 if any(severity in {"critical", "high"} for severity in severities) else 1
+        return (priority, best, result.path.lower())
+
+    return sorted(results, key=key)
+
+
+def result_summary(result: ScanResult) -> str:
+    top_severity = max((SEVERITY_SCORE.get(finding.severity, 0) for finding in result.findings), default=0)
+    severity = next((name for name, score in SEVERITY_SCORE.items() if score == top_severity), "info")
+    titles = "; ".join(finding.title for finding in result.findings[:3])
+    if len(result.findings) > 3:
+        titles += f"; +{len(result.findings) - 3} more"
+    return f"{severity.upper()} | {result.verdict.upper()} | {result.path} | {titles or result.error or 'No findings'}"
+
+
+def launch_removal_gui(summary: ScanSummary, paths: list[Path], quarantine_dir: Path, cleanable_hashes: set[str], *, redact: bool | str = True) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not open GUI: {type(exc).__name__}: {exc}")
+        print_report(summary, paths, signatures_enabled=False, redact=redact)
+        return
+
+    root = tk.Tk()
+    root.title("CLN Removal Tool")
+    root.geometry("1100x720")
+
+    recommendation = "We recommend you to remove high & critical first, make sure the scan is correct and not a false flag."
+    tk.Label(root, text=recommendation, anchor="w", fg="#7a2e00", font=("Segoe UI", 10, "bold")).pack(fill="x", padx=10, pady=(10, 4))
+
+    top = ttk.Frame(root)
+    top.pack(fill="both", expand=True, padx=10, pady=6)
+    filter_bar = ttk.Frame(root)
+    filter_bar.pack(fill="x", padx=10, pady=(0, 6))
+    severity_filter = tk.StringVar(value="all")
+    search_filter = tk.StringVar(value="")
+    hide_low = tk.BooleanVar(value=False)
+    ttk.Label(filter_bar, text="Severity").pack(side="left")
+    severity_box = ttk.Combobox(filter_bar, textvariable=severity_filter, values=("all", "critical", "high", "medium", "low", "info"), width=10, state="readonly")
+    severity_box.pack(side="left", padx=(4, 10))
+    ttk.Checkbutton(filter_bar, text="Hide low/info", variable=hide_low).pack(side="left", padx=(0, 10))
+    ttk.Label(filter_bar, text="Search").pack(side="left")
+    search_entry = ttk.Entry(filter_bar, textvariable=search_filter, width=36)
+    search_entry.pack(side="left", padx=(4, 10))
+    columns = ("severity", "verdict", "kind", "path", "info")
+    tree = ttk.Treeview(top, columns=columns, show="headings", selectmode="extended", height=18)
+    for column, width in (("severity", 90), ("verdict", 90), ("kind", 110), ("path", 390), ("info", 380)):
+        tree.heading(column, text=column.title())
+        tree.column(column, width=width, stretch=column in {"path", "info"})
+    scrollbar = ttk.Scrollbar(top, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scrollbar.set)
+    tree.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    details = tk.Text(root, height=12, wrap="word")
+    details.pack(fill="both", expand=False, padx=10, pady=(0, 8))
+    details.configure(state="disabled")
+
+    status_var = tk.StringVar(value=f"Scanned {summary.scanned_files} file(s). Select findings to quarantine or delete.")
+    status = ttk.Label(root, textvariable=status_var, anchor="w")
+    status.pack(fill="x", padx=10, pady=(0, 8))
+
+    hits = sorted_review_results([result for result in summary.results if result.findings or result.error])
+    iid_to_result: dict[str, ScanResult] = {}
+
+    def result_display_severity(result: ScanResult) -> str:
+        severities = [finding.severity for finding in result.findings]
+        return "critical" if "critical" in severities else "high" if "high" in severities else "medium" if "medium" in severities else "low" if "low" in severities else "info"
+
+    def refresh_tree(*_: object) -> None:
+        tree.delete(*tree.get_children())
+        iid_to_result.clear()
+        wanted = severity_filter.get()
+        query = search_filter.get().lower().strip()
+        for index, result in enumerate(hits):
+            display_severity = result_display_severity(result)
+            if wanted != "all" and display_severity != wanted:
+                continue
+            if hide_low.get() and display_severity in {"low", "info"}:
+                continue
+            info = "; ".join(f"{finding.rule_id}: {finding.title}" for finding in result.findings[:2]) or result.error or ""
+            haystack = f"{result.path} {result.kind} {result.verdict} {info}".lower()
+            if query and query not in haystack:
+                continue
+            iid = str(index)
+            iid_to_result[iid] = result
+            tree.insert("", "end", iid=iid, values=(display_severity.upper(), result.verdict.upper(), result.kind, output_text(result.path, redact=redact), output_text(info, redact=redact, limit=260)))
+        status_var.set(f"Showing {len(tree.get_children())} finding(s). Select findings to quarantine, export, or restore.")
+
+    def selected_results() -> list[ScanResult]:
+        return [iid_to_result[item] for item in tree.selection() if item in iid_to_result]
+
+    def show_details(_: object | None = None) -> None:
+        selected = selected_results()
+        details.configure(state="normal")
+        details.delete("1.0", "end")
+        if not selected:
+            details.insert("end", "Select a finding to view details.\n")
+        for result in selected[:8]:
+            details.insert("end", f"{result.path}\n")
+            details.insert("end", f"Kind: {result.kind}  Verdict: {result.verdict}  Score: {result.score}\n")
+            if result.size is not None:
+                details.insert("end", f"Size: {result.size} bytes\n")
+            if result.modified:
+                details.insert("end", f"Modified: {result.modified}\n")
+            if result.file_type:
+                details.insert("end", f"Type: {result.file_type}\n")
+            if result.sha256:
+                details.insert("end", f"SHA-256: {result.sha256}\n")
+            if result.error:
+                details.insert("end", f"Error: {result.error}\n")
+            for finding in result.findings:
+                details.insert("end", f"- {finding.severity.upper()} {finding.rule_id}: {finding.title}\n")
+                details.insert("end", f"  Detail: {finding.detail}\n")
+                if finding.evidence:
+                    details.insert("end", f"  Evidence: {finding.evidence}\n")
+                if finding.remediation:
+                    details.insert("end", f"  Info: {finding.remediation}\n")
+            details.insert("end", "\n")
+        details.configure(state="disabled")
+
+    def remove_selected(*, delete: bool) -> None:
+        selected = selected_results()
+        if not selected:
+            messagebox.showinfo("CLN Removal Tool", "Select one or more file findings first.")
+            return
+        action = "permanently delete" if delete else "quarantine"
+        if not messagebox.askyesno("Confirm removal", f"CLN will {action} selected file results only. Continue?\n\n{recommendation}"):
+            return
+        report = remove_scan_results(selected, quarantine_dir, delete=delete)
+        status_var.set("; ".join(report[:3]) + (f"; +{len(report) - 3} more" if len(report) > 3 else ""))
+        messagebox.showinfo("Removal results", "\n".join(report[:40]))
+
+    def full_known_bad_cleanup() -> None:
+        if not messagebox.askyesno("Full known-bad cleanup", "Run full cleanup for the built-in known-bad SHA-256 profile?\n\nFiles are hash-verified before removal and quarantined by default."):
+            return
+        report = clean_known_bad(summary, quarantine_dir, delete=False, cleanable_hashes=cleanable_hashes)
+        status_var.set("; ".join(report[:3]) + (f"; +{len(report) - 3} more" if len(report) > 3 else ""))
+        messagebox.showinfo("Known-bad cleanup results", "\n".join(report[:60]))
+
+    def select_high_critical() -> None:
+        selected = []
+        for iid in tree.get_children():
+            result = iid_to_result.get(str(iid))
+            if result and result_display_severity(result) in {"critical", "high"}:
+                selected.append(iid)
+        tree.selection_set(selected)
+        show_details()
+
+    def export_selected() -> None:
+        selected = selected_results()
+        if not selected:
+            messagebox.showinfo("CLN Removal Tool", "Select one or more findings first.")
+            return
+        export_summary = ScanSummary(scanned_files=len(selected), skipped_files=0, results=selected)
+        try:
+            path = export_evidence_bundle(Path("reports") / "gui-bundles", export_summary, paths, [], redact=redact)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", f"{type(exc).__name__}: {exc}")
+            return
+        status_var.set(f"Exported selected evidence: {path}")
+
+    def restore_from_manifest() -> None:
+        from tkinter import filedialog
+
+        manifest = filedialog.askopenfilename(title="Select CLN quarantine manifest", filetypes=(("CLN manifests", "*.manifest.json"), ("JSON", "*.json"), ("All files", "*.*")))
+        if not manifest:
+            return
+        report = restore_quarantine_manifest(Path(manifest))
+        status_var.set("; ".join(report[:3]))
+        messagebox.showinfo("Restore results", "\n".join(report[:20]))
+
+    tree.bind("<<TreeviewSelect>>", show_details)
+    severity_box.bind("<<ComboboxSelected>>", refresh_tree)
+    search_filter.trace_add("write", refresh_tree)
+    hide_low.trace_add("write", refresh_tree)
+    buttons = ttk.Frame(root)
+    buttons.pack(fill="x", padx=10, pady=(0, 10))
+    ttk.Button(buttons, text="Select High/Critical", command=select_high_critical).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="Export Selected", command=export_selected).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="Quarantine Selected", command=lambda: remove_selected(delete=False)).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="Delete Selected", command=lambda: remove_selected(delete=True)).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="Restore Quarantine", command=restore_from_manifest).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="Full Known-Bad Cleanup", command=full_known_bad_cleanup).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="Close", command=root.destroy).pack(side="right")
+    refresh_tree()
+    show_details()
+    root.mainloop()
 
 
 def detect_file_type(path: Path, sample: bytes) -> str:
@@ -1935,6 +3116,22 @@ def resolve_script_strings(text: str) -> str:
             joined = "".join(values)
             if joined:
                 parts.append(joined)
+    variables = resolve_simple_variables(text)
+    if variables:
+        parts.append("\n".join(f"{name}={value}" for name, value in variables.items()))
+        expanded = text
+        for name, value in variables.items():
+            expanded = re.sub(rf"\${re.escape(name)}\b", value, expanded)
+        if expanded != text:
+            parts.append(expanded)
+    for match in re.finditer(r"(?is)(['\"])(.*?)\1\s*-[fF]\s*([^\r\n;]{1,500})", text):
+        template = match.group(2)
+        values = re.findall(r"['\"]([^'\"]{0,120})['\"]", match.group(3))
+        if values:
+            rendered = template
+            for index, value in enumerate(values):
+                rendered = rendered.replace("{" + str(index) + "}", value)
+            parts.append(rendered)
     for match in re.finditer(r"(?is)(['\"])([^'\"]{2,500})\1\s*\.\s*(?:split\(\s*['\"]{2}\s*\)\s*)?reverse\(\s*\)\s*\.\s*join\(\s*['\"]{2}\s*\)", text):
         parts.append(match.group(2)[::-1])
     for match in re.finditer(r"(?is)(['\"])([^'\"]{1,500})\1\s*\.\s*replace\(\s*(['\"])(.*?)\3\s*,\s*(['\"])(.*?)\5\s*\)", text):
@@ -1951,9 +3148,50 @@ def resolve_script_strings(text: str) -> str:
                 chars.append(chr(value))
         if chars:
             parts.append("".join(chars))
+    for match in re.finditer(r"(?is)\[Text\.Encoding\]::UTF8\.GetString\(\s*\[Convert\]::FromBase64String\(\s*['\"]([A-Za-z0-9+/=]{12,})['\"]\s*\)\s*\)", text):
+        decoded = decode_base64_text(match.group(1))
+        if decoded:
+            parts.append(decoded)
+    for match in re.finditer(r"(?is)([0-9]{1,3}(?:\s*,\s*[0-9]{1,3}){3,200})\s*(?:\||\))?.{0,80}?(?:-bxor|\^)\s*([0-9]{1,3})", text):
+        key = int(match.group(2))
+        chars = []
+        for item in re.findall(r"[0-9]{1,3}", match.group(1)):
+            value = int(item) ^ key
+            if 0 <= value <= 255:
+                chars.append(chr(value))
+        decoded = "".join(chars)
+        if is_probably_text(decoded):
+            parts.append(decoded)
     normalized = "\n".join(dict.fromkeys(part for part in parts if part))
     normalized = normalized.replace("`", "")
     return normalized if normalized != text else ""
+
+
+def resolve_simple_variables(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for match in re.finditer(r"(?im)^\s*\$([A-Za-z_][\w-]{0,40})\s*=\s*(.+?)\s*$", text):
+        name = match.group(1)
+        expression = match.group(2)
+        pieces = re.findall(r"['\"]([^'\"]{0,200})['\"]", expression)
+        if pieces and re.fullmatch(r"(?is)\s*['\"][^'\"]*['\"](?:\s*(?:\+|&)\s*['\"][^'\"]*['\"])*\s*", expression):
+            values[name] = "".join(pieces)
+    return values
+
+
+def decode_base64_text(value: str) -> str:
+    padded = value + ("=" * (-len(value) % 4))
+    try:
+        raw = base64.b64decode(padded, validate=False)
+    except (binascii.Error, ValueError):
+        return ""
+    for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeError:
+            continue
+        if is_probably_text(text):
+            return text
+    return ""
 
 
 def extract_quoted_strings(text: str) -> list[str]:
@@ -2041,23 +3279,35 @@ def read_structured_document_bytes(path: Path, sample: bytes, limit: int = MAX_P
 
 
 def parse_lnk_command(data: bytes) -> tuple[str, str]:
+    parsed = parse_lnk_metadata(data)
+    return parsed.get("target", ""), parsed.get("arguments", "")
+
+
+def parse_lnk_metadata(data: bytes) -> dict[str, str]:
     if len(data) < 0x4C or not data.startswith(b"\x4C\x00\x00\x00\x01\x14\x02\x00"):
-        return "", ""
+        return {}
     offset = 0x4C
     flags = int.from_bytes(data[0x14:0x18], "little", signed=False)
     is_unicode = bool(flags & 0x80)
+    metadata = {
+        "flags": f"0x{flags:08x}",
+        "hotkey": f"0x{int.from_bytes(data[0x40:0x42], 'little', signed=False):04x}" if len(data) >= 0x42 else "",
+        "show_command": str(int.from_bytes(data[0x3C:0x40], "little", signed=False)) if len(data) >= 0x40 else "",
+    }
     if flags & 0x01:
         if offset + 2 > len(data):
-            return "", ""
+            return metadata
         id_list_size = int.from_bytes(data[offset : offset + 2], "little", signed=False)
         offset += 2 + id_list_size
     if flags & 0x02:
         if offset + 4 > len(data):
-            return "", ""
+            return metadata
         link_info_size = int.from_bytes(data[offset : offset + 4], "little", signed=False)
+        metadata.update(parse_lnk_link_info(data[offset : min(len(data), offset + link_info_size)]))
         offset += link_info_size
-    values: dict[int, str] = {}
-    for bit in (0x04, 0x08, 0x10, 0x20, 0x40):
+    names = {0x04: "name", 0x08: "relative_path", 0x10: "working_dir", 0x20: "arguments", 0x40: "icon_path"}
+    values: dict[str, str] = {}
+    for bit, name in names.items():
         if not (flags & bit):
             continue
         if offset + 2 > len(data):
@@ -2070,14 +3320,37 @@ def parse_lnk_command(data: bytes) -> tuple[str, str]:
         raw = data[offset : offset + byte_count]
         offset += byte_count
         value = raw.decode("utf-16-le" if is_unicode else "cp1252", errors="replace").strip("\0\r\n ")
-        values[bit] = value
-    target = values.get(0x08) or values.get(0x04) or ""
-    arguments = values.get(0x20) or ""
-    return target, arguments
+        values[name] = value
+    metadata.update(values)
+    metadata["target"] = metadata.get("local_base_path") or values.get("relative_path") or values.get("name") or ""
+    return metadata
+
+
+def parse_lnk_link_info(data: bytes) -> dict[str, str]:
+    if len(data) < 28:
+        return {}
+    flags = int.from_bytes(data[8:12], "little", signed=False)
+    local_base_offset = int.from_bytes(data[16:20], "little", signed=False)
+    common_path_suffix_offset = int.from_bytes(data[24:28], "little", signed=False)
+    values: dict[str, str] = {}
+    if flags & 0x01 and 0 < local_base_offset < len(data):
+        values["local_base_path"] = read_lnk_c_string(data, local_base_offset)
+    if 0 < common_path_suffix_offset < len(data):
+        values["common_path_suffix"] = read_lnk_c_string(data, common_path_suffix_offset)
+    return values
+
+
+def read_lnk_c_string(data: bytes, offset: int) -> str:
+    end = data.find(b"\0", offset)
+    if end == -1:
+        end = len(data)
+    return data[offset:end].decode("cp1252", errors="replace").strip()
 
 
 def scan_lnk_content(path: Path, data: bytes) -> list[Finding]:
-    target, arguments = parse_lnk_command(data)
+    metadata = parse_lnk_metadata(data)
+    target = metadata.get("target", "")
+    arguments = metadata.get("arguments", "")
     command = " ".join(part for part in (target, arguments) if part).strip()
     if not command:
         return []
@@ -2089,11 +3362,15 @@ def scan_lnk_content(path: Path, data: bytes) -> list[Finding]:
                 "shortcut-suspicious-target",
                 "Shortcut launches a suspicious command interpreter",
                 "high",
-                f"{path.name}: {command[:300]}",
+                f"{path.name}: {command[:300]}; working_dir={metadata.get('working_dir', '')}; icon={metadata.get('icon_path', '')}; hotkey={metadata.get('hotkey', '')}; show={metadata.get('show_command', '')}",
                 safe_excerpt(command_bytes),
                 "Inspect the parsed shortcut target and arguments before opening it.",
             )
         )
+    if arguments and not any(finding.rule_id == "shortcut-suspicious-target" for finding in findings):
+        findings.append(Finding("shortcut-has-arguments", "Shortcut has explicit command-line arguments", "low", f"{path.name}: {command[:300]}"))
+    if metadata.get("icon_path") and any(token in metadata["icon_path"].lower() for token in ("shell32.dll", "imageres.dll")) and re.search(r"(?is)\b(?:powershell|cmd|mshta|wscript|rundll32)", command):
+        findings.append(Finding("shortcut-deceptive-icon", "Shortcut uses a generic system icon while launching a risky command", "medium", metadata["icon_path"]))
     for finding in scan_content_rule_matches(command_bytes, "Pattern matched in parsed shortcut command line"):
         findings.append(Finding(f"shortcut-{finding.rule_id}", f"Shortcut command: {finding.title}", finding.severity, finding.detail, finding.evidence, finding.remediation))
     return findings
@@ -2102,20 +3379,43 @@ def scan_lnk_content(path: Path, data: bytes) -> list[Finding]:
 def extract_pdf_analysis_bytes(data: bytes) -> bytes:
     chunks = [data[:MAX_TEXT_SCAN_BYTES]]
     for match in re.finditer(rb"(?is)(\d+)\s+(\d+)\s+obj(.*?)endobj", data[:MAX_PDF_OBJECT_SCAN_BYTES]):
+        object_id = match.group(1) + b" " + match.group(2) + b" obj"
         body = match.group(3)
+        chunks.append(b"\n%% object " + object_id + b" offset " + str(match.start()).encode("ascii") + b"\n")
         chunks.append(body[:200_000])
         stream_match = re.search(rb"(?is)<<(.*?)>>\s*stream\r?\n(.*?)\r?\nendstream", body)
         if stream_match:
             stream_dict = stream_match.group(1)
             stream_data = stream_match.group(2)
-            if b"/FlateDecode" in stream_dict:
-                try:
-                    chunks.append(zlib.decompress(stream_data)[:200_000])
-                except zlib.error:
-                    pass
-            else:
-                chunks.append(stream_data[:200_000])
+            decoded = decode_pdf_stream(stream_dict, stream_data)
+            chunks.append(decoded[:200_000])
     return b"\n".join(chunks)
+
+
+def decode_pdf_stream(stream_dict: bytes, stream_data: bytes) -> bytes:
+    data = stream_data.strip(b"\r\n")
+    filters = re.findall(rb"/(?:Filter\s*)?/(FlateDecode|ASCIIHexDecode|ASCII85Decode|AHx|A85|Fl)", stream_dict)
+    if not filters:
+        return data
+    for raw_filter in filters:
+        name = raw_filter.lower()
+        try:
+            if name in {b"flatedecode", b"fl"}:
+                data = zlib.decompress(data)
+            elif name in {b"asciihexdecode", b"ahx"}:
+                data = asciihex_decode(data)
+            elif name in {b"ascii85decode", b"a85"}:
+                data = base64.a85decode(data.replace(b"<~", b"").replace(b"~>", b""), adobe=False)
+        except (ValueError, zlib.error, binascii.Error):
+            break
+    return data
+
+
+def asciihex_decode(data: bytes) -> bytes:
+    hex_text = re.sub(rb"\s+", b"", data.split(b">", 1)[0])
+    if len(hex_text) % 2:
+        hex_text += b"0"
+    return bytes.fromhex(hex_text.decode("ascii", errors="ignore"))
 
 
 def scan_pdf_content(path: Path, data: bytes) -> list[Finding]:
@@ -2126,6 +3426,7 @@ def scan_pdf_content(path: Path, data: bytes) -> list[Finding]:
         ("pdf-open-action", "PDF contains an automatic open action", rb"(?is)/OpenAction\b"),
         ("pdf-launch-action", "PDF contains a launch action", rb"(?is)/Launch\b"),
         ("pdf-additional-action", "PDF contains additional automatic actions", rb"(?is)/AA\b"),
+        ("pdf-uri-action", "PDF contains URI action", rb"(?is)/URI\b\s*(?:\(|<|/)"),
         ("pdf-embedded-file", "PDF contains embedded files", rb"(?is)/(?:EmbeddedFiles|Filespec|EmbeddedFile)\b"),
     )
     for rule_id, title, pattern in rules:
@@ -2146,6 +3447,9 @@ def scan_pdf_content(path: Path, data: bytes) -> list[Finding]:
 
 def extract_ole_strings(data: bytes) -> bytes:
     chunks = [data[:MAX_TEXT_SCAN_BYTES]]
+    for stream_name, stream_data in extract_ole_streams(data):
+        chunks.append(f"\n%% ole stream {stream_name}\n".encode("utf-8", errors="replace"))
+        chunks.append(stream_data[:200_000])
     for encoding in ("latin-1", "utf-16-le"):
         try:
             text = data[:MAX_STRUCTURED_TEXT_BYTES].decode(encoding, errors="ignore")
@@ -2157,12 +3461,78 @@ def extract_ole_strings(data: bytes) -> bytes:
     return b"\n".join(chunks)
 
 
+def extract_ole_streams(data: bytes) -> list[tuple[str, bytes]]:
+    if not data.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") or len(data) < 512:
+        return []
+    sector_shift = int.from_bytes(data[0x1E:0x20], "little", signed=False)
+    if sector_shift not in {9, 12}:
+        return []
+    sector_size = 1 << sector_shift
+    directory_start = int.from_bytes(data[0x30:0x34], "little", signed=False)
+    fat_sector_count = int.from_bytes(data[0x2C:0x30], "little", signed=False)
+    difat = [int.from_bytes(data[0x4C + index * 4 : 0x50 + index * 4], "little", signed=False) for index in range(109)]
+    fat_sectors = [sector for sector in difat if sector < 0xFFFFFFF0][:fat_sector_count]
+    fat: list[int] = []
+    for sector in fat_sectors[:128]:
+        raw = ole_sector(data, sector, sector_size)
+        if not raw:
+            continue
+        fat.extend(int.from_bytes(raw[offset : offset + 4], "little", signed=False) for offset in range(0, len(raw), 4))
+    directory_bytes = read_ole_chain(data, directory_start, fat, sector_size, limit=512 * 128)
+    streams: list[tuple[str, bytes]] = []
+    for offset in range(0, len(directory_bytes), 128):
+        entry = directory_bytes[offset : offset + 128]
+        if len(entry) < 128:
+            break
+        object_type = entry[66]
+        if object_type != 2:
+            continue
+        name_len = int.from_bytes(entry[64:66], "little", signed=False)
+        name_raw = entry[: max(0, name_len - 2)]
+        name = name_raw.decode("utf-16-le", errors="replace").strip("\0")
+        start_sector = int.from_bytes(entry[116:120], "little", signed=False)
+        size = int.from_bytes(entry[120:124], "little", signed=False)
+        if not name or size <= 0 or size > MAX_STRUCTURED_TEXT_BYTES or start_sector >= 0xFFFFFFF0:
+            continue
+        stream = read_ole_chain(data, start_sector, fat, sector_size, limit=min(size, MAX_STRUCTURED_TEXT_BYTES))
+        streams.append((name, stream[:size]))
+        if len(streams) >= 64:
+            break
+    return streams
+
+
+def ole_sector(data: bytes, sector: int, sector_size: int) -> bytes:
+    offset = 512 + sector * sector_size
+    if offset < 0 or offset + sector_size > len(data):
+        return b""
+    return data[offset : offset + sector_size]
+
+
+def read_ole_chain(data: bytes, start_sector: int, fat: list[int], sector_size: int, *, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    sector = start_sector
+    seen: set[int] = set()
+    while sector < len(fat) and sector not in seen and len(b"".join(chunks)) < limit:
+        seen.add(sector)
+        chunk = ole_sector(data, sector, sector_size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        next_sector = fat[sector]
+        if next_sector >= 0xFFFFFFF8:
+            break
+        sector = next_sector
+    return b"".join(chunks)[:limit]
+
+
 def scan_ole_content(path: Path, data: bytes) -> list[Finding]:
     analysis = extract_ole_strings(data)
     findings: list[Finding] = []
     for rule_id, title, pattern in (
+        ("ole-vba-module", "OLE document contains VBA module stream indicators", rb"(?is)%% ole stream .*(?:VBA|dir|Module|ThisDocument|Sheet\d+)"),
         ("ole-vba-autostart", "OLE/VBA macro has auto-start trigger", rb"(?is)\b(?:AutoOpen|Auto_Open|Document_Open|Workbook_Open|AutoExec|AutoClose)\b"),
         ("ole-vba-shell", "OLE/VBA macro invokes shell or process execution", rb"(?is)\b(?:Shell|WScript\.Shell|CreateObject|WinExec|ShellExecute)\b.{0,200}\b(?:cmd|powershell|wscript|cscript|mshta|rundll32)?"),
+        ("ole-vba-api-declare", "OLE/VBA macro declares suspicious Windows APIs", rb"(?is)\bDeclare\b.{0,160}\b(?:URLDownloadToFile|ShellExecute|WinExec|VirtualAlloc|WriteProcessMemory|CreateThread)\b"),
         ("ole-vba-obfuscation", "OLE/VBA macro has common obfuscation indicators", rb"(?is)\b(?:ChrW?|StrReverse|Environ|Execute|Eval)\b"),
     ):
         match = re.search(pattern, analysis)
@@ -2455,6 +3825,8 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
         for result in summary.results
         if result.kind == "file" and result.sha256 and result.sha256.lower() in cleanable_hashes
     ]
+    known_bad_paths.extend(discover_known_bad_artifact_paths(cleanable_hashes))
+    known_bad_paths = sorted(set(known_bad_paths), key=lambda item: str(item).lower())
     if not known_bad_paths:
         external_hits = [
             result
@@ -2495,7 +3867,20 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
             else:
                 quarantine_dir.mkdir(parents=True, exist_ok=True)
                 destination = unique_quarantine_path(quarantine_dir, path, latest_hash)
-                path.replace(destination)
+                try:
+                    shutil.move(str(path), str(destination))
+                except PermissionError:
+                    if not destination.exists() or path.exists():
+                        raise
+                write_quarantine_manifest(
+                    quarantine_dir,
+                    original_path=path,
+                    quarantine_path=destination,
+                    sha256_value=latest_hash,
+                    size=destination.stat().st_size,
+                    reason="known-bad-hash",
+                    eligible=True,
+                )
                 report.append(f"Quarantined known-bad file: {path} -> {destination}")
         except Exception as exc:  # noqa: BLE001 - cleanup should report each failure.
             report.append(f"Failed to remove {path}: {type(exc).__name__}: {exc}")
@@ -2503,6 +3888,104 @@ def clean_known_bad(summary: ScanSummary, quarantine_dir: Path, *, delete: bool,
     if platform.system() == "Windows":
         report.extend(remove_known_bad_startup_entries(cleanable_hashes))
     return report
+
+
+def remove_scan_results(results: list[ScanResult], quarantine_dir: Path, *, delete: bool = False) -> list[str]:
+    report: list[str] = []
+    file_results = [result for result in results if result.kind == "file"]
+    if not file_results:
+        return ["No removable file results were selected. Registry, process, archive-entry, and memory findings are informational in this removal view."]
+    for result in file_results:
+        path = Path(result.path)
+        if not path.exists():
+            report.append(f"Already gone: {path}")
+            continue
+        try:
+            latest_hash, stable = hash_with_stability_check(path)
+            latest_hash = latest_hash.lower()
+            if not stable:
+                report.append(f"Skipped unstable file, metadata changed while hashing: {path}")
+                continue
+            if result.sha256 and latest_hash != result.sha256.lower():
+                report.append(f"Skipped changed file, hash no longer matches scan result: {path}")
+                continue
+            if delete:
+                path.unlink()
+                report.append(f"Deleted selected file: {path}")
+            else:
+                quarantine_dir.mkdir(parents=True, exist_ok=True)
+                destination = unique_quarantine_path(quarantine_dir, path, latest_hash)
+                try:
+                    shutil.move(str(path), str(destination))
+                except PermissionError:
+                    if not destination.exists() or path.exists():
+                        raise
+                write_quarantine_manifest(
+                    quarantine_dir,
+                    original_path=path,
+                    quarantine_path=destination,
+                    sha256_value=latest_hash,
+                    size=destination.stat().st_size,
+                    reason="selected-finding",
+                    eligible=True,
+                )
+                report.append(f"Quarantined selected file: {path} -> {destination}")
+        except Exception as exc:  # noqa: BLE001
+            report.append(f"Failed to remove {path}: {type(exc).__name__}: {exc}")
+    return report
+
+
+def discover_known_bad_artifact_paths(cleanable_hashes: set[str]) -> list[Path]:
+    cleanable_hashes = {item.lower() for item in cleanable_hashes}
+    wanted_names = {
+        name.lower()
+        for digest, names in BUILTIN_KNOWN_BAD_FILENAMES.items()
+        if digest.lower() in cleanable_hashes
+        for name in names
+    }
+    if not wanted_names:
+        return []
+    roots: list[Path] = []
+    for value in (os.environ.get("USERPROFILE"), os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA"), os.environ.get("TEMP"), os.environ.get("TMP")):
+        if value:
+            roots.append(Path(value))
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        roots.extend([Path(userprofile) / "Downloads", Path(userprofile) / "Desktop", Path(userprofile) / "Documents"])
+    found: list[Path] = []
+    seen_roots: set[str] = set()
+    for root in roots:
+        try:
+            resolved = str(root.resolve()).lower()
+        except OSError:
+            continue
+        if resolved in seen_roots or not root.exists():
+            continue
+        seen_roots.add(resolved)
+        scanned = 0
+        stack = [root]
+        while stack and scanned < 20_000:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        scanned += 1
+                        if scanned >= 20_000:
+                            break
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name.lower() not in DEFAULT_EXCLUDED_DIRS:
+                                    stack.append(Path(entry.path))
+                                continue
+                            if entry.is_file(follow_symlinks=False) and entry.name.lower() in wanted_names:
+                                path = Path(entry.path)
+                                if sha256_file(path).lower() in cleanable_hashes:
+                                    found.append(path)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return found
 
 
 def hash_with_stability_check(path: Path) -> tuple[str, bool]:
@@ -2530,6 +4013,68 @@ def unique_quarantine_path(quarantine_dir: Path, source: Path, sha256_value: str
         candidate = quarantine_dir / f"{sha256_value[:12]}_{counter}_{safe_name}.quarantine"
         counter += 1
     return candidate
+
+
+def write_quarantine_manifest(
+    quarantine_dir: Path,
+    *,
+    original_path: Path,
+    quarantine_path: Path,
+    sha256_value: str,
+    size: int,
+    reason: str,
+    eligible: bool,
+) -> Path:
+    manifest = {
+        "schema": "cln-quarantine-manifest-v1",
+        "cln_version": VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "original_path": str(original_path),
+        "quarantine_path": str(quarantine_path),
+        "sha256": sha256_value.lower(),
+        "size": size,
+        "reason": reason,
+        "restore_eligible": eligible,
+    }
+    manifest_name = f"{sha256_value[:12]}_{int(time.time() * 1000)}.manifest.json"
+    manifest_path = quarantine_dir / manifest_name
+    secure_write_text_file(manifest_path, json.dumps(manifest, indent=2))
+    return manifest_path
+
+
+def restore_quarantine_manifest(manifest_path: Path) -> list[str]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"Could not read quarantine manifest: {type(exc).__name__}: {exc}"]
+    if manifest.get("schema") != "cln-quarantine-manifest-v1":
+        return ["Unsupported quarantine manifest schema."]
+    if not manifest.get("restore_eligible", False):
+        return ["Manifest says this item is not eligible for restore."]
+    quarantine_path = Path(str(manifest.get("quarantine_path") or ""))
+    original_path = Path(str(manifest.get("original_path") or ""))
+    expected_hash = str(manifest.get("sha256") or "").lower()
+    if not quarantine_path.exists():
+        return [f"Quarantined file is missing: {quarantine_path}"]
+    try:
+        current_hash = sha256_file(quarantine_path).lower()
+    except OSError as exc:
+        return [f"Could not hash quarantined file: {type(exc).__name__}: {exc}"]
+    if expected_hash and current_hash != expected_hash:
+        return [f"Hash mismatch; refusing restore: expected {expected_hash}, got {current_hash}"]
+    if original_path.exists():
+        return [f"Original path already exists; refusing to overwrite: {original_path}"]
+    try:
+        original_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(quarantine_path), str(original_path))
+        except PermissionError:
+            if original_path.exists() and sha256_file(original_path).lower() == current_hash:
+                return [f"Restored quarantined file: {quarantine_path} -> {original_path} (quarantine copy could not be removed automatically)"]
+            raise
+    except OSError as exc:
+        return [f"Restore failed: {type(exc).__name__}: {exc}"]
+    return [f"Restored quarantined file: {quarantine_path} -> {original_path}"]
 
 
 def stop_known_bad_processes(paths: list[Path], cleanable_hashes: set[str]) -> list[str]:
@@ -2676,6 +4221,169 @@ def signature_cache_key(path: Path) -> tuple[str, int, int] | None:
 
 def should_cache_signature_result(path: Path, status: str, signer: str) -> bool:
     return status == "Valid" and bool(signer.strip())
+
+
+
+def scan_lnk(path: Path, data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    if len(data) < 76 or data[:4] != b'\x4c\x00\x00\x00':
+        return findings
+    
+    flags = int.from_bytes(data[20:24], 'little')
+    offset = 76
+    
+    has_target_id_list = bool(flags & 0x01)
+    has_link_info = bool(flags & 0x02)
+    has_name = bool(flags & 0x04)
+    has_rel_path = bool(flags & 0x08)
+    has_working_dir = bool(flags & 0x10)
+    has_args = bool(flags & 0x20)
+    has_icon_loc = bool(flags & 0x40)
+    is_unicode = bool(flags & 0x80)
+
+    target = ""
+    arguments = ""
+
+    if has_target_id_list:
+        if offset + 2 > len(data): return findings
+        id_list_size = int.from_bytes(data[offset:offset+2], 'little')
+        offset += 2 + id_list_size
+    
+    if has_link_info:
+        if offset + 4 > len(data): return findings
+        link_info_size = int.from_bytes(data[offset:offset+4], 'little')
+        if offset + 28 <= len(data):
+            flags_info = int.from_bytes(data[offset+8:offset+12], 'little')
+            local_base_offset = int.from_bytes(data[offset+16:offset+20], 'little')
+            if flags_info & 0x01 and offset + local_base_offset < len(data):
+                end = data.find(b'\x00', offset + local_base_offset)
+                if end == -1: end = len(data)
+                target = data[offset+local_base_offset:end].decode('mbcs', errors='replace')
+        offset += link_info_size
+
+    def read_string(offset: int) -> tuple[str, int]:
+        if offset >= len(data):
+            return "", offset
+        count = int.from_bytes(data[offset:offset+2], 'little')
+        offset += 2
+        mult = 2 if is_unicode else 1
+        encoding = 'utf-16-le' if is_unicode else 'mbcs'
+        end = offset + count * mult
+        if end > len(data): end = len(data)
+        return data[offset:end].decode(encoding, errors='replace'), end
+
+    if has_name:
+        _, offset = read_string(offset)
+    if has_rel_path:
+        _, offset = read_string(offset)
+    if has_working_dir:
+        _, offset = read_string(offset)
+    if has_args:
+        arguments, offset = read_string(offset)
+        
+    lowered_target = target.lower()
+    lowered_args = arguments.lower()
+    
+    risky_exes = ("powershell", "pwsh", "cmd.exe", "mshta", "rundll32", "wscript", "cscript", "certutil", "bitsadmin")
+    if any(exe in lowered_target or exe in lowered_args for exe in risky_exes):
+        findings.append(Finding("lnk-suspicious-target", "Shortcut executes a high-risk system tool", "high", f"Target: {target} | Args: {arguments}"))
+    elif arguments:
+        findings.append(Finding("lnk-has-arguments", "Shortcut has arguments", "low", f"Target: {target} | Args: {arguments}"))
+
+    return findings
+
+def scan_pdf(path: Path, data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    if b"/JavaScript" in data or b"/JS" in data:
+        findings.append(Finding("pdf-javascript", "PDF contains embedded JavaScript", "medium", "Matches /JavaScript or /JS"))
+    if b"/OpenAction" in data or b"/Launch" in data:
+        findings.append(Finding("pdf-auto-launch", "PDF contains auto-launch or open actions", "high", "Matches /OpenAction or /Launch"))
+    if b"/EmbeddedFiles" in data:
+        findings.append(Finding("pdf-embedded-files", "PDF contains embedded files", "medium", "Matches /EmbeddedFiles"))
+    if b"/URI" in data:
+        urls = re.findall(rb'/URI\s*\((.*?)\)', data)
+        for url in urls:
+            try:
+                decoded = url.decode('utf-8', errors='ignore')
+                if re.search(r'(?i)https?://', decoded) and not any(trusted in decoded.lower() for trusted in ('adobe.com', 'microsoft.com')):
+                    findings.append(Finding("pdf-external-uri", "PDF contains external URI", "low", decoded))
+            except Exception:
+                pass
+    return findings
+
+def scan_pe(path: Path, data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    if len(data) < 64 or data[:2] != b"MZ":
+        return findings
+    pe_offset = int.from_bytes(data[0x3C:0x40], "little")
+    if pe_offset <= 0 or pe_offset + 24 > len(data) or data[pe_offset:pe_offset+4] != b"PE\0\0":
+        return findings
+    
+    num_sections = int.from_bytes(data[pe_offset+6:pe_offset+8], "little")
+    opt_header_size = int.from_bytes(data[pe_offset+20:pe_offset+22], "little")
+    sections_offset = pe_offset + 24 + opt_header_size
+    
+    suspicious_sections = {b".upx", b".vmp", b".themida", b".enigma"}
+    
+    for i in range(num_sections):
+        sec_offset = sections_offset + i * 40
+        if sec_offset + 40 > len(data): break
+        sec_name = data[sec_offset:sec_offset+8].rstrip(b'\0').lower()
+        if any(sec_name.startswith(susp) for susp in suspicious_sections):
+            findings.append(Finding("pe-packed-section", "Executable contains known packer section", "high", sec_name.decode('ascii', errors='ignore')))
+        
+        chars = int.from_bytes(data[sec_offset+36:sec_offset+40], "little")
+        if (chars & 0x20000000) and (chars & 0x80000000) and (chars & 0x40000000):
+            findings.append(Finding("pe-rwx-section", "Executable contains Read/Write/Execute (RWX) section", "high", sec_name.decode('ascii', errors='ignore')))
+    return findings
+
+def scan_ole_vba(path: Path, data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    if not data.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        return findings
+    
+    if b"VBA" in data or b"vbaProject" in data or b"AutoOpen" in data or b"Document_Open" in data or b"Shell" in data:
+        if b"AutoOpen" in data or b"Document_Open" in data or b"AutoExec" in data:
+            findings.append(Finding("ole-auto-exec-macro", "OLE Document contains auto-executing macro", "high", "Found AutoOpen/Document_Open strings"))
+        else:
+            findings.append(Finding("ole-vba-macro", "OLE Document contains VBA macros", "medium", "Found VBA project indicators"))
+        
+        if b"URLDownloadToFile" in data or b"CreateObject" in data or b"WScript.Shell" in data:
+            findings.append(Finding("ole-suspicious-api", "OLE macro contains suspicious API imports", "high", "Found URLDownloadToFile, CreateObject, or WScript.Shell"))
+    return findings
+
+def scan_powershell_ast(path: Path, data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    text = data.decode('utf-8', errors='ignore')
+    
+    if re.search(r'`[a-zA-Z]', text):
+        findings.append(Finding("ps-backtick-obfuscation", "PowerShell script uses backtick obfuscation", "medium", "Found backticks splitting strings"))
+    if re.search(r'\{[0-9]+\}\s*-[fF]', text):
+        findings.append(Finding("ps-format-obfuscation", "PowerShell script uses format string obfuscation", "medium", "Found -f string formatting"))
+    if re.search(r'\$\w+\s*\+=\s*[\'"]', text):
+        findings.append(Finding("ps-var-split-obfuscation", "PowerShell script builds strings dynamically", "low", "Found variable concatenation"))
+    
+    import platform, subprocess
+    if platform.system() == "Windows" and path.suffix.lower() in {".ps1", ".psm1"} and len(data) < 500_000:
+        try:
+            script = f"""
+            $ErrorActionPreference = 'SilentlyContinue'
+            $path = '{path.resolve()}'
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+            $ast.FindAll({{ $args[0] -is [System.Management.Automation.Language.CommandAst] }}, $true) | 
+                ForEach-Object {{ $_.GetCommandName() }} | 
+                Where-Object {{ $_ -match 'iex|Invoke-Expression|DownloadString|WebClient|WScript.Shell|BitTransfer' }} |
+                Select-Object -Unique
+            """
+            powershell = trusted_windows_executable("WindowsPowerShell", "v1.0", "powershell.exe")
+            if powershell:
+                completed = subprocess.run([str(powershell), "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=5)
+                if completed.stdout.strip():
+                    findings.append(Finding("ps-ast-suspicious-command", "PowerShell AST found suspicious command execution", "high", completed.stdout.strip()[:100].replace('\n', ' ')))
+        except Exception:
+            pass
+            
+    return findings
 
 
 def scan_startup_locations() -> list[ScanResult]:
@@ -3020,6 +4728,7 @@ def analyze_extension_manifest(extension_id: str, manifest_path: Path) -> ScanRe
         findings.append(Finding("browser-extension-review", "Browser extension has permissions worth reviewing", "medium", f"id={extension_id}, permissions={', '.join(sorted(permissions))[:300]}"))
     if sideloaded and (risky_permissions or broad_host_access):
         findings.append(Finding("browser-extension-sideloaded", "Browser extension appears sideloaded or locally installed", "medium", f"id={extension_id}, manifest={manifest_path}"))
+    findings.extend(scan_extension_code(extension_id, manifest_path, manifest))
     if not findings:
         return None
     result = ScanResult(path=str(manifest_path), kind="browser-extension")
@@ -3040,6 +4749,40 @@ def extension_permissions(manifest: dict) -> set[str]:
     if isinstance(externally_connectable, dict) and isinstance(externally_connectable.get("matches"), list):
         permissions.update(str(value) for value in externally_connectable["matches"])
     return permissions
+
+
+def scan_extension_code(extension_id: str, manifest_path: Path, manifest: dict) -> list[Finding]:
+    root = manifest_path.parent
+    script_paths: set[Path] = set()
+    background = manifest.get("background")
+    if isinstance(background, dict):
+        service_worker = background.get("service_worker")
+        if isinstance(service_worker, str):
+            script_paths.add(root / service_worker)
+        scripts = background.get("scripts")
+        if isinstance(scripts, list):
+            script_paths.update(root / str(item) for item in scripts)
+    for item in manifest.get("content_scripts", []) if isinstance(manifest.get("content_scripts"), list) else []:
+        if isinstance(item, dict) and isinstance(item.get("js"), list):
+            script_paths.update(root / str(script) for script in item["js"])
+    findings: list[Finding] = []
+    for script in sorted(script_paths, key=lambda item: str(item).lower())[:100]:
+        try:
+            if not path_is_relative_to(script.resolve(), root.resolve()) or not script.is_file() or script.stat().st_size > MAX_ARCHIVE_TEXT_ENTRY_BYTES:
+                continue
+            data = script.read_bytes()
+        except OSError:
+            continue
+        lowered = data.lower()
+        detail = f"id={extension_id}, script={script}"
+        if re.search(rb"(?is)\b(?:eval|new\s+Function|importScripts)\b.{0,160}\bhttps?://", data) or b"chrome.tabs.executeScript" in data:
+            findings.append(Finding("browser-extension-remote-code", "Browser extension script loads or executes remote code", "high", detail, describe_match(data, 0, min(len(data), 80))))
+        if any(token in lowered for token in (b"document.cookie", b"localstorage", b"chrome.cookies", b"authorization", b"bearer")) and any(token in lowered for token in (b"fetch(", b"xmlhttprequest", b"sendbeacon", b"webhook")):
+            findings.append(Finding("browser-extension-credential-access", "Browser extension script may access credentials or session data and send it out", "high", detail))
+        for finding in scan_content_bytes(data):
+            if finding.severity in {"high", "critical"}:
+                findings.append(Finding(f"browser-extension-{finding.rule_id}", f"Browser extension script: {finding.title}", finding.severity, detail, finding.evidence, finding.remediation))
+    return findings
 
 
 def scan_wmi_event_consumers() -> list[ScanResult]:
@@ -3089,6 +4832,78 @@ def scan_running_processes() -> list[ScanResult]:
     results = scan_process_command_lines()
     results.extend(scan_process_memory_regions())
     return results
+
+
+def scan_network_connections() -> list[ScanResult]:
+    if platform.system() != "Windows":
+        return []
+    powershell = trusted_windows_executable("WindowsPowerShell", "v1.0", "powershell.exe")
+    if not powershell:
+        return []
+    script = (
+        "$tcp = Get-NetTCPConnection -ErrorAction SilentlyContinue | "
+        "Select-Object @{n='Protocol';e={'TCP'}},State,LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess;"
+        "$udp = Get-NetUDPEndpoint -ErrorAction SilentlyContinue | "
+        "Select-Object @{n='Protocol';e={'UDP'}},@{n='State';e={'Listen'}},LocalAddress,LocalPort,@{n='RemoteAddress';e={''}},@{n='RemotePort';e={0}},OwningProcess;"
+        "@($tcp) + @($udp) | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run([str(powershell), "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=15, check=False)
+    except Exception:
+        return []
+    try:
+        data = json.loads(completed.stdout) if completed.stdout.strip() else []
+    except json.JSONDecodeError:
+        return []
+    items = data if isinstance(data, list) else [data]
+    results: list[ScanResult] = []
+    for item in items[:5000]:
+        if not isinstance(item, dict):
+            continue
+        remote = str(item.get("RemoteAddress") or "")
+        remote_port = int(item.get("RemotePort") or 0)
+        local = str(item.get("LocalAddress") or "")
+        local_port = int(item.get("LocalPort") or 0)
+        pid = str(item.get("OwningProcess") or "")
+        protocol = str(item.get("Protocol") or "TCP")
+        state = str(item.get("State") or "")
+        findings = network_connection_findings(
+            remote,
+            remote_port,
+            local_address=local,
+            local_port=local_port,
+            protocol=protocol,
+            state=state,
+        )
+        if not findings:
+            continue
+        remote_label = f"{remote}:{remote_port}" if remote and remote_port else ""
+        local_label = f"{local}:{local_port}" if local_port else local
+        result = ScanResult(path=f"network:{pid}:{protocol}:{state}:{local_label}->{remote_label}", kind="network")
+        result.findings.extend(findings)
+        results.append(result)
+    return results
+
+
+def network_connection_findings(remote: str, port: int, *, local_address: str = "", local_port: int = 0, protocol: str = "TCP", state: str = "") -> list[Finding]:
+    findings: list[Finding] = []
+    detail = f"{protocol} {state or 'unknown'} local={local_address}:{local_port} remote={remote}:{port}"
+    if port in SUSPICIOUS_NETWORK_PORTS or local_port in SUSPICIOUS_NETWORK_PORTS:
+        findings.append(Finding("network-suspicious-port", "Network endpoint uses a commonly abused port", "medium", detail))
+    elif state.lower() in {"listen", "bound"} or not remote:
+        severity = "low" if local_address not in {"127.0.0.1", "::1", "localhost"} else "info"
+        findings.append(Finding("network-listening-port", "Local listening port observed", severity, detail))
+    else:
+        findings.append(Finding("network-active-port", "Active network port observed", "info", detail))
+    if remote and is_raw_public_ip(remote):
+        findings.append(Finding("network-raw-public-ip", "Active connection uses a raw public IP address", "low", f"{remote}:{port}"))
+    return findings
+
+
+def is_raw_public_ip(value: str) -> bool:
+    if not re.fullmatch(r"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)", value):
+        return False
+    return not value.startswith(("10.", "127.", "169.254.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."))
 
 
 def scan_process_command_lines() -> list[ScanResult]:
