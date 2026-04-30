@@ -34,6 +34,20 @@ Every contribution should answer three questions:
 
 Good commit messages and PR descriptions are not bureaucratic overhead—they are documentation of the thinking behind the code.
 
+## AI Assistance
+
+You can use AI to help write code, but you must understand what the AI produces. AI makes mistakes, especially with security-related code. Before submitting AI-generated changes:
+
+- **Verify the code works** – Test it. Don't assume AI got it right.
+- **Understand the logic** – If you can't explain what the code does, don't submit it.
+- **Security knowledge required** – This is a security scanner. You need knowledge of:
+  - How viruses and malware work
+  - Common attack vectors and evasion techniques
+  - Windows internals, PE files, archives, scripts
+  - Why certain patterns are suspicious
+
+AI can help with syntax and boilerplate, but it doesn't understand security context. The responsibility is yours.
+
 ## Reporting
 
 If you observe violations of this code of conduct, please report them by opening an issue.
