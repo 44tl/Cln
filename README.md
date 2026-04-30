@@ -1,137 +1,165 @@
 # CLN Scanner
 
-CLN is monitored daily, with fast updates for new threats and detection improvements. Join the Discord for instant updates, security notes, and guides: https://discord.gg/cqX6eAmcrp
+> A fast, single-file Windows-focused security scanner for suspicious downloads, scam files, and startup threats.
 
-CLN is a simple, single-file Windows-focused scanner for suspicious downloads, weird new apps, unsigned apps, scam files, scripts, archives, and startup entries.
+**Join the Discord for instant updates, security notes, and guides:** [:earth_americas: https://discord.gg/cqX6eAmcrp](https://discord.gg/cqX6eAmcrp)
 
-It is designed to boot fast, show what it is doing, and avoid expensive work by default. It makes no network calls and does not clean anything unless you ask it to.
-
-The scanner is only `cln.py`. There is no install step for the default scanner and no package to import.
+CLN is a simple, single-file Windows-focused scanner for suspicious downloads, weird new apps, unsigned apps, scam files, scripts, archives, and startup entries. It is designed to boot fast, show what it is doing, and avoid expensive work by default. It makes no network calls and does not clean anything unless you ask it to.
 
 [![CLN Scanner Demo](demo.gif)](demo.mp4)
 
-```powershell
-python .\cln.py
+---
+
+## Quick Start
+
+```bash
+python cln.py
 ```
 
-Optional integrations such as YARA support are listed in `requirements.txt`:
+Install optional dependencies (YARA support):
 
-```powershell
+```bash
 python -m pip install -r requirements.txt
 ```
 
-## Run
+---
 
-Scan common risk locations such as Downloads, Desktop, Documents, and temp:
+## Usage
 
-```powershell
-python .\cln.py
+### Basic Scanning
+
+Scan common risk locations (Downloads, Desktop, Documents, temp):
+
+```bash
+python cln.py
 ```
 
 Scan a specific folder:
 
-```powershell
-python .\cln.py C:\Users\You\Downloads
+```bash
+python cln.py C:\Users\You\Downloads
 ```
 
 Scan the whole user profile:
 
-```powershell
-python .\cln.py --full
+```bash
+python cln.py --full
 ```
+
+### Startup & Process Checks
 
 Include Windows startup checks:
 
-```powershell
-python .\cln.py --startup
+```bash
+python cln.py --startup
 ```
 
-`--startup` also checks suspicious Scheduled Tasks, WMI event subscriptions, and risky Chromium-family browser extensions when those locations are available.
+> `--startup` also checks suspicious Scheduled Tasks, WMI event subscriptions, and risky Chromium-family browser extensions when those locations are available.
 
 Include running process checks:
 
-```powershell
-python .\cln.py --processes
+```bash
+python cln.py --processes
 ```
 
-`--processes` checks command lines for suspicious living-off-the-land usage and, on Windows, scans process memory metadata for executable private regions such as RWX pages.
+> `--processes` checks command lines for suspicious living-off-the-land usage and, on Windows, scans process memory metadata for executable private regions such as RWX pages.
+
+### Administrator Notes
 
 For the deepest scan, open PowerShell or Command Prompt as Administrator first. Without admin rights, Windows may block locked temp files or protected app files; CLN will skip those and tell you how many were blocked. Temp files can also disappear while the scan is running; CLN counts those as skipped instead of showing them as errors.
 
+### Output Formats
+
 Output JSON:
 
-```powershell
-python .\cln.py --json
+```bash
+python cln.py --json
 ```
 
 Output CSV for spreadsheet review:
 
-```powershell
-python .\cln.py --csv
+```bash
+python cln.py --csv
 ```
 
 Write SARIF for CI/CD or code scanning:
 
-```powershell
-python .\cln.py --sarif .\reports\cln.sarif
+```bash
+python cln.py --sarif .\reports\cln.sarif
 ```
+
+### Baseline Comparisons
 
 Only show findings that were not present in a previous JSON report:
 
-```powershell
-python .\cln.py --json > .\reports\baseline.json
-python .\cln.py --baseline .\reports\baseline.json
+```bash
+python cln.py --json > .\reports\baseline.json
+python cln.py --baseline .\reports\baseline.json
 ```
 
-Every scan saves a readable text report:
+> Every scan saves a readable text report: `reports\cln-scan-YYYYMMDD-HHMMSS-microseconds.txt`
 
-```text
-reports\cln-scan-YYYYMMDD-HHMMSS-microseconds.txt
+### GUI Mode
+
+Open the built-in review and removal GUI:
+
+```bash
+python cln.py --gui
 ```
 
-Report, JSON, and terminal output redact common tokens, webhook URLs, control characters, and the current home path by default. Use `--no-redact` only for local forensic work where raw evidence is required.
+> The GUI shows high and critical findings first, includes finding details and remediation information, and supports quarantining selected file findings. It also includes a full known-bad cleanup action for CLN's built-in `7123e1514b939b165985560057fe3c761440a9fff9783a3b84e861fd2888d4ab` profile; matching files are hash-verified locally before removal.
 
-Use a lighter redaction mode when you need to preserve paths but still hide secrets:
-
-```powershell
-python .\cln.py --redact-level secrets --json
-```
+### Advanced Options
 
 Deep-check Windows app signatures:
 
-```powershell
-python .\cln.py --signatures
+```bash
+python cln.py --signatures
 ```
 
 Scan source-code scripts outside risky folders too:
 
-```powershell
-python .\cln.py --include-source
+```bash
+python cln.py --include-source
 ```
 
 Limit nested ZIP recursion for hostile or very complex archives:
 
-```powershell
-python .\cln.py --archive-depth 1 C:\Users\You\Downloads
+```bash
+python cln.py --archive-depth 1 C:\Users\You\Downloads
 ```
 
 Quiet mode:
 
-```powershell
-python .\cln.py --quiet
+```bash
+python cln.py --quiet
 ```
+
+### Redaction Control
+
+> Report, JSON, and terminal output redact common tokens, webhook URLs, control characters, and the current home path by default. Use `--no-redact` only for local forensic work where raw evidence is required.
+
+Use a lighter redaction mode when you need to preserve paths but still hide secrets:
+
+```bash
+python cln.py --redact-level secrets --json
+```
+
+### Cleanup Actions
 
 Quarantine confirmed known-bad files:
 
-```powershell
-python .\cln.py --clean --startup
+```bash
+python cln.py --clean --startup
 ```
 
-Cleanup acts on built-in confirmed known-bad hashes by default. To also quarantine hashes supplied through `--known-bad`, opt in explicitly:
+> Cleanup acts on built-in confirmed known-bad hashes by default. To also quarantine hashes supplied through `--known-bad`, opt in explicitly:
 
-```powershell
-python .\cln.py --known-bad .\hashes.json --clean --clean-user-hashes
+```bash
+python cln.py --known-bad .\hashes.json --clean --clean-user-hashes
 ```
+
+### Custom Rules & Signatures
 
 Structured hash lists are supported for provenance:
 
@@ -148,42 +176,45 @@ Structured hash lists are supported for provenance:
 
 Add external content rules without editing `cln.py`:
 
-```powershell
-python .\cln.py --rules .\rules.json
+```bash
+python cln.py --rules .\rules.json
 ```
 
 Run YARA rules when `yara-python` is installed:
 
-```powershell
-python .\cln.py --yara-rules .\yara-rules
+```bash
+python cln.py --yara-rules .\yara-rules
 ```
+
+---
 
 ## What It Checks
 
-- Suspicious executable and script files.
-- New runnable files in user folders.
-- Unsigned or untrusted Windows apps when `--signatures` is used.
-- File-type mismatches such as renamed executables or disguised shortcuts.
-- Fake document names like `invoice.pdf.exe`.
-- Scam-like names and script content.
-- Zip files, Office documents, Java/Android packages, and browser/package archives containing runnable files.
-- Basic visibility for unsupported `.7z`, `.rar`, `.cab`, `.iso`, and `.img` containers.
-- Archive path traversal, suspicious compression ratios, nested ZIPs, embedded macro projects, and external Office links.
-- Configurable nested ZIP recursion depth, with depth-limit findings for skipped inner archives.
-- Sliding-window entropy checks for risky executables and scripts.
-- Native PE checks for ImpHash, suspicious section names, high-entropy executable sections, writable executable sections, risky import clusters, timestamp anomalies, and unusual entry points.
-- Native LNK string parsing for shortcut targets and arguments.
-- PDF object and stream checks for JavaScript, open/launch actions, additional actions, and embedded files.
-- Legacy OLE string extraction for VBA auto-start, shell execution, and obfuscation indicators.
-- Lightweight script string resolution for simple concatenation, reversal, replace, and character-array obfuscation before content rules run.
-- Evidence snippets with byte offsets and line numbers for matched script-content rules.
-- Windows startup folders, registry Run/RunOnce entries, current-user COM overrides, IFEO debugger keys, AppInit/AppCert DLL settings, shell icon overlay handlers, Scheduled Tasks, WMI subscriptions, and risky browser extensions.
-- Optional running process command-line and executable private memory checks with `--processes`.
-- Compiled Python artifacts, raw IP indicators, and suspicious URL TLDs in scripts.
-- Known-bad hashes and trusted-hash allowlist visibility.
+| Category | Description |
+|----------|-------------|
+| **Executable & Scripts** | Suspicious executable and script files, new runnable files in user folders |
+| **Signatures** | Unsigned or untrusted Windows apps when `--signatures` is used |
+| **File Type Mismatches** | Renamed executables, disguised shortcuts |
+| **Fake Documents** | Names like `invoice.pdf.exe`, scam-like names |
+| **Archives** | ZIP, Office documents, Java/Android packages, browser/package archives |
+| **Archive Analysis** | Archive path traversal, suspicious compression ratios, nested ZIPs, embedded macro projects, external Office links |
+| **Entropy Checks** | Sliding-window entropy checks for risky executables and scripts |
+| **PE Analysis** | ImpHash, suspicious section names, high-entropy executable sections, writable executable sections, risky import clusters, timestamp anomalies, unusual entry points |
+| **Shortcut Parsing** | Native LNK string parsing for shortcut targets and arguments |
+| **PDF Analysis** | JavaScript, open/launch actions, additional actions, embedded files |
+| **OLE Extraction** | Legacy OLE string extraction for VBA auto-start, shell execution, obfuscation indicators |
+| **Script Deobfuscation** | Lightweight script string resolution for simple concatenation, reversal, replace, and character-array obfuscation before content rules run |
+| **Evidence Snippets** | Byte offsets and line numbers for matched script-content rules |
+| **Startup Locations** | Windows startup folders, registry Run/RunOnce entries, current-user COM overrides, IFEO debugger keys, AppInit/AppCert DLL settings, shell icon overlay handlers, Scheduled Tasks, WMI subscriptions, risky browser extensions |
+| **Process Checks** | Optional running process command-line and executable private memory checks with `--processes` |
+| **GUI Features** | Built-in Tkinter removal GUI with high/critical findings first, selected-file quarantine/delete actions, known-bad hash cleanup |
+| **Indicators** | Compiled Python artifacts, raw IP indicators, suspicious URL TLDs in scripts |
+| **Hash Lists** | Known-bad hashes and trusted-hash allowlist visibility |
+
+---
 
 ## Safety
 
-CLN reports suspicious signs by default. Cleanup only acts on built-in confirmed known-bad hash matches unless `--clean-user-hashes` is supplied with `--clean`.
+> CLN reports suspicious signs by default. Cleanup only acts on built-in confirmed known-bad hash matches unless `--clean-user-hashes` is supplied with `--clean`.
 
 No scanner can catch every threat. Use CLN as one layer alongside Windows Defender, browser protections, and careful account recovery steps after a real infection.
