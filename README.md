@@ -1,4 +1,4 @@
-# CLN Scanner
+# CLN Scanner / BETA (EXPECT BUGS)
 
 **Join the Discord for instant updates, security notes, and guides:** https://discord.gg/cqX6eAmcrp
 
