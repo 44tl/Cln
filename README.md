@@ -1,8 +1,6 @@
 # CLN Scanner
 
-> A fast, single-file Windows-focused security scanner for suspicious downloads, scam files, and startup threats.
-
-**Join the Discord for instant updates, security notes, and guides:** [:earth_americas: https://discord.gg/cqX6eAmcrp](https://discord.gg/cqX6eAmcrp)
+**Join the Discord for instant updates, security notes, and guides:** https://discord.gg/cqX6eAmcrp
 
 CLN is a simple, single-file Windows-focused scanner for suspicious downloads, weird new apps, unsigned apps, scam files, scripts, archives, and startup entries. It is designed to boot fast, show what it is doing, and avoid expensive work by default. It makes no network calls and does not clean anything unless you ask it to.
 
