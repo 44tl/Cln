@@ -1,4 +1,4 @@
-# CLN Scanner / BETA (EXPECT BUGS)
+# CLN Scanner / BETA (EXPECT BUGS) - V0.5.0
 
 **Join the Discord for instant updates, security notes, and guides:** https://discord.gg/cqX6eAmcrp
 
