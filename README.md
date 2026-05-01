@@ -8,19 +8,32 @@ CLN is a simple, single-file Windows-focused scanner for suspicious downloads, w
 
 ## Quick Start
 
+**CLI mode (default):**
 ```bash
 python cln.py
 ```
+Scans common risk locations and prints a report to the terminal.
 
-Install optional dependencies (YARA support):
-
+**System tray mode (background + click-to-open GUI):**
+```bash
+python cln.py --tray
+```
+Runs a minimal tray icon; click it to open the full settings GUI. Requires `pystray` and `Pillow`:
 ```bash
 python -m pip install -r requirements.txt
 ```
 
+**GUI mode (scan immediately then show review GUI):**
+```bash
+python cln.py --gui
+```
+Performs a scan and opens the graphical review/removal window.
+
 ---
 
 ## Usage
+
+**Default behavior:** Running `python cln.py` performs a headless scan of common locations (Downloads, Desktop, Documents, temp) and prints a text report. This is CLI-first and works on any platform.
 
 ### Basic Scanning
 
@@ -42,23 +55,32 @@ Scan the whole user profile:
 python cln.py --full
 ```
 
-### Startup & Process Checks
+### Startup, Process & Behavior Checks
 
-Include Windows startup checks:
+Include Windows startup checks (folders, registry, scheduled tasks, WMI, browser extensions):
 
 ```bash
 python cln.py --startup
 ```
 
-> `--startup` also checks suspicious Scheduled Tasks, WMI event subscriptions, and risky Chromium-family browser extensions when those locations are available.
-
-Include running process checks:
+Include running process checks (command lines and memory regions):
 
 ```bash
 python cln.py --processes
 ```
 
-> `--processes` checks command lines for suspicious living-off-the-land usage and, on Windows, scans process memory metadata for executable private regions such as RWX pages.
+Analyze process parent-child relationships for Living-off-the-Land patterns:
+
+```bash
+python cln.py --behavior
+```
+
+Monitor process creations in real-time:
+
+```bash
+python cln.py --monitor
+```
+> `--monitor` is Windows-only and runs until you press `Ctrl+C`.
 
 ### Administrator Notes
 
@@ -84,6 +106,12 @@ Write SARIF for CI/CD or code scanning:
 python cln.py --sarif .\reports\cln.sarif
 ```
 
+Include a chronological timeline in JSON/text reports:
+
+```bash
+python cln.py --timeline
+```
+
 ### Baseline Comparisons
 
 Only show findings that were not present in a previous JSON report:
@@ -95,19 +123,27 @@ python cln.py --baseline .\reports\baseline.json
 
 > Every scan saves a readable text report: `reports\cln-scan-YYYYMMDD-HHMMSS-microseconds.txt`
 
-### GUI Mode
+### GUI & Tray Modes
 
-Open the built-in review and removal GUI:
+Open the built-in review and removal GUI **after** a scan:
 
 ```bash
 python cln.py --gui
 ```
 
-> The GUI shows high and critical findings first, includes finding details and remediation information, and supports quarantining selected file findings. It also includes a full known-bad cleanup action for CLN's built-in `7123e1514b939b165985560057fe3c761440a9fff9783a3b84e861fd2888d4ab` profile; matching files are hash-verified locally before removal.
+> The GUI shows high and critical findings first, includes finding details and remediation information, and supports quarantining selected file findings. It also includes a full known-bad cleanup action for CLN's built-in hashes; matching files are hash-verified locally before removal.
+
+Run CLN as a **system tray application** (Windows only):
+
+```bash
+python cln.py --tray
+```
+
+> Tray mode starts a small icon in the notification area. Click the icon to open the settings/scan GUI on demand. Combine with `--quiet` to run silently in the background.
 
 ### Advanced Options
 
-Deep-check Windows app signatures:
+Deep-check Windows Authenticode signatures:
 
 ```bash
 python cln.py --signatures
@@ -119,21 +155,74 @@ Scan source-code scripts outside risky folders too:
 python cln.py --include-source
 ```
 
-Limit nested ZIP recursion for hostile or very complex archives:
+Map local network connections to owning processes (Windows only):
 
 ```bash
-python cln.py --archive-depth 1 C:\Users\You\Downloads
+python cln.py --network
 ```
 
-Quiet mode:
+Run heuristic entropy and import analysis on PE files:
+
+```bash
+python cln.py --heuristic
+```
+
+Scan process memory for hollowing and executable regions:
+
+```bash
+python cln.py --memory-scan
+```
+
+Run self-protection and anti-tampering checks:
+
+```bash
+python cln.py --stealth
+```
+
+Limit nested ZIP recursion depth:
+
+```bash
+python cln.py --archive-depth 4
+```
+
+Quiet mode (suppress progress output):
 
 ```bash
 python cln.py --quiet
 ```
 
+Disable colored terminal output:
+
+```bash
+python cln.py --no-color
+```
+
+Run continuous polling scans (multiple rounds):
+
+```bash
+python cln.py --continuous --poll-interval 30 --poll-count 3
+```
+
+### Scan Profiles
+
+Use a preset profile that bundles common flags:
+
+```bash
+python cln.py --profile deep
+python cln.py --profile forensic
+python cln.py --profile paranoid
+```
+
+| Profile | Purpose |
+|---------|---------|
+| `fast` | Quick local checks for common risky locations. |
+| `deep` | Adds stronger file, archive, signature, and source coverage. |
+| `forensic` | Adds startup, process, network, and timeline checks. |
+| `paranoid` | Raises scan limits and depth for maximum review. |
+
 ### Redaction Control
 
-> Report, JSON, and terminal output redact common tokens, webhook URLs, control characters, and the current home path by default. Use `--no-redact` only for local forensic work where raw evidence is required.
+Report, JSON, and terminal output redact common tokens, webhook URLs, control characters, and the current home path by default.
 
 Use a lighter redaction mode when you need to preserve paths but still hide secrets:
 
@@ -141,23 +230,67 @@ Use a lighter redaction mode when you need to preserve paths but still hide secr
 python cln.py --redact-level secrets --json
 ```
 
+Disable redaction entirely (local forensic work only):
+
+```bash
+python cln.py --no-redact
+```
+
 ### Cleanup Actions
 
-Quarantine confirmed known-bad files:
+**Quarantine** confirmed known-bad files (built-in hashes only):
 
 ```bash
 python cln.py --clean --startup
 ```
 
-> Cleanup acts on built-in confirmed known-bad hashes by default. To also quarantine hashes supplied through `--known-bad`, opt in explicitly:
+Permanent **delete** instead of quarantine:
+
+```bash
+python cln.py --clean --delete
+```
+
+Quarantine files matching **user-supplied** hashes (opt-in required):
 
 ```bash
 python cln.py --known-bad .\hashes.json --clean --clean-user-hashes
 ```
 
+> Cleanup acts on built-in known-bad hashes by default. To also act on `--known-bad` hashes, you must supply `--clean-user-hashes`. Files are moved to the `quarantine/` folder and a manifest is written so they can be restored.
+
+Restore a quarantined file from a manifest:
+
+```bash
+python cln.py --restore .\quarantine\manifest.json
+```
+
 ### Custom Rules & Signatures
 
-Structured hash lists are supported for provenance:
+Add external content rules without editing `cln.py`:
+
+```bash
+python cln.py --rules .\rules.json
+```
+
+Run YARA rules when `yara-python` is installed:
+
+```bash
+python cln.py --yara-rules .\yara-rules
+```
+
+Run CLN's built-in YARA-lite rule engine:
+
+```bash
+python cln.py --yara-lite-rules rules\cln-strong.yara-lite.json
+```
+
+Provide your own known-bad and known-good hash lists:
+
+```bash
+python cln.py --known-bad .\bad-hashes.json --known-good .\good-hashes.json
+```
+
+Structured hash lists with provenance metadata:
 
 ```json
 {
@@ -170,16 +303,34 @@ Structured hash lists are supported for provenance:
 }
 ```
 
-Add external content rules without editing `cln.py`:
+Change the report output directory:
 
 ```bash
-python cln.py --rules .\rules.json
+python cln.py --report-dir .\reports
 ```
 
-Run YARA rules when `yara-python` is installed:
+Change the quarantine directory:
 
 ```bash
-python cln.py --yara-rules .\yara-rules
+python cln.py --quarantine-dir .\quarantine
+```
+
+Export an evidence bundle (copies high-risk samples + metadata):
+
+```bash
+python cln.py --bundle .\evidence
+```
+
+Limit content scan size (default 75 MB):
+
+```bash
+python cln.py --max-mb 150
+```
+
+Adjust parallel worker count (default: auto):
+
+```bash
+python cln.py --workers 8
 ```
 
 ---
@@ -203,6 +354,9 @@ python cln.py --yara-rules .\yara-rules
 | **Evidence Snippets** | Byte offsets and line numbers for matched script-content rules |
 | **Startup Locations** | Windows startup folders, registry Run/RunOnce entries, current-user COM overrides, IFEO debugger keys, AppInit/AppCert DLL settings, shell icon overlay handlers, Scheduled Tasks, WMI subscriptions, risky browser extensions |
 | **Process Checks** | Optional running process command-line and executable private memory checks with `--processes` |
+| **Behavior Graph** | Parent-child process lineage analysis with `--behavior` |
+| **Real-time Monitor** | Process-creation monitoring with `--monitor` |
+| **Network-Local** | Active TCP/UDP connections mapped to processes with `--network` |
 | **GUI Features** | Built-in Tkinter removal GUI with high/critical findings first, selected-file quarantine/delete actions, known-bad hash cleanup |
 | **Indicators** | Compiled Python artifacts, raw IP indicators, suspicious URL TLDs in scripts |
 | **Hash Lists** | Known-bad hashes and trusted-hash allowlist visibility |
@@ -211,6 +365,6 @@ python cln.py --yara-rules .\yara-rules
 
 ## Safety
 
-> CLN reports suspicious signs by default. Cleanup only acts on built-in confirmed known-bad hash matches unless `--clean-user-hashes` is supplied with `--clean`.
+> CLN reports suspicious signs by default. Cleanup only acts on built-in confirmed known-bad hash matches unless `--clean-user-hashes` is supplied with `--clean`. Files are moved to a quarantine folder, not deleted, and a manifest is written so they can be restored.
 
 No scanner can catch every threat. Use CLN as one layer alongside Windows Defender, browser protections, and careful account recovery steps after a real infection.
