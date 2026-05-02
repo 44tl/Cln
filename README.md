@@ -4,7 +4,8 @@
 
 CLN is a lightweight, Windows-focused forensic scanner and antivirus designed to detect suspicious downloads, unsigned applications, scam scripts, and persistence mechanisms. Version 0.6.0 introduces a high-performance Tauri 2.0 GUI, AES-256 encrypted quarantine, and native OS interrogation bypassing all shell-based subprocesses.
 
-Note that: CLN Anti-Virus won't be published before any full testing, proper production test, and polishing. But scanner is out and it doesn't require full test.
+> [!NOTE]
+> CLN Anti-Virus won't be published before any full testing, proper production test, and polishing. But scanner is out and it doesn't require full test.
 
 ---
 
